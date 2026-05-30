@@ -63,10 +63,8 @@ io.on('connection', (socket) => {
         const state = getBoxState(sede, boxId);
         const nuevaCancion = { ...cancion, agregadoPor: usuario };
 
-        // SIEMPRE metemos la canción a la lista visual (historial)
         state.playlist.push(nuevaCancion);
 
-        // Si es la primera que se agrega, la hacemos sonar
         if (!state.cancionActual) {
             state.cancionActual = nuevaCancion;
             state.estadoReproduccion = 'playing';
@@ -76,6 +74,47 @@ io.on('connection', (socket) => {
         io.to(`${sede}-${boxId}`).emit('estado_box_actualizado', state);
     });
 
+    // RECUPERADO: ELIMINAR CANCIÓN
+    socket.on('eliminar_cancion', ({ sede, boxId, cancionId }) => {
+        const state = getBoxState(sede, boxId);
+        const indexToDelete = state.playlist.findIndex(c => c.id === cancionId);
+
+        if (indexToDelete !== -1) {
+            state.playlist.splice(indexToDelete, 1);
+
+            // Ajustamos el índice para no perder el hilo de la reproducción
+            if (indexToDelete < state.currentIndex) {
+                state.currentIndex--;
+            } else if (indexToDelete === state.currentIndex) {
+                // Si borramos la canción que está sonando, pasamos a la siguiente
+                if (state.playlist.length > state.currentIndex) {
+                    state.cancionActual = state.playlist[state.currentIndex];
+                    state.tiempoActual = 0;
+                } else {
+                    state.cancionActual = null;
+                    state.estadoReproduccion = 'idle';
+                    state.currentIndex = 0;
+                }
+            }
+        }
+        io.to(`${sede}-${boxId}`).emit('estado_box_actualizado', state);
+    });
+
+    // RECUPERADO: REORDENAR PLAYLIST
+    socket.on('reordenar_playlist', ({ sede, boxId, startIndex, endIndex }) => {
+        const state = getBoxState(sede, boxId);
+        const [removed] = state.playlist.splice(startIndex, 1);
+        state.playlist.splice(endIndex, 0, removed);
+
+        // Si reordenamos, buscamos dónde quedó la canción actual para actualizar el índice
+        if (state.cancionActual) {
+            state.currentIndex = state.playlist.findIndex(c => c.id === state.cancionActual.id);
+        }
+
+        io.to(`${sede}-${boxId}`).emit('estado_box_actualizado', state);
+    });
+
+    // CONTROLES: PLAY, PAUSE, NEXT, PREV, SEEK
     socket.on('comando_reproductor', ({ sede, boxId, comando, valor }) => {
         const roomKey = `${sede}-${boxId}`;
         const state = getBoxState(sede, boxId);
@@ -84,7 +123,6 @@ io.on('connection', (socket) => {
         if (comando === 'pause') state.estadoReproduccion = 'paused';
 
         if (comando === 'next') {
-            // Avanzamos el índice sin eliminar nada de la lista
             if (state.currentIndex < state.playlist.length - 1) {
                 state.currentIndex++;
                 state.cancionActual = state.playlist[state.currentIndex];
@@ -92,7 +130,16 @@ io.on('connection', (socket) => {
                 state.tiempoActual = 0;
             } else {
                 state.estadoReproduccion = 'idle';
-                state.cancionActual = null; // Volvemos a la pantalla de espera
+                state.cancionActual = null;
+            }
+        }
+
+        if (comando === 'prev') {
+            if (state.currentIndex > 0) {
+                state.currentIndex--;
+                state.cancionActual = state.playlist[state.currentIndex];
+                state.estadoReproduccion = 'playing';
+                state.tiempoActual = 0;
             }
         }
 
