@@ -20,8 +20,8 @@ function getBoxState(sede, boxId) {
             sede, boxId,
             estadoReproduccion: 'idle',
             cancionActual: null,
-            playlist: [], // Lista completa
-            currentIndex: 0, // Índice de la canción que suena
+            playlist: [], // El historial completo
+            currentIndex: 0,
             tiempoActual: 0
         };
     }
@@ -31,21 +31,24 @@ function getBoxState(sede, boxId) {
 io.on('connection', (socket) => {
 
     socket.on('buscar_cancion', async ({ query }) => {
-        const searchResults = await ytsr(query, { limit: 5 });
-        const formatted = searchResults.items
-            .filter(item => item.type === 'video')
-            .map(item => ({
-                id: Math.random().toString(36),
-                title: item.title,
-                videoId: item.id,
-                thumbnail: item.bestThumbnail.url
-            }));
-        socket.emit('resultados_busqueda', formatted);
+        try {
+            const searchResults = await ytsr(query, { limit: 5 });
+            const formatted = searchResults.items
+                .filter(item => item.type === 'video')
+                .map(item => ({
+                    id: Math.random().toString(36),
+                    title: item.title,
+                    videoId: item.id,
+                    thumbnail: item.bestThumbnail.url
+                }));
+            socket.emit('resultados_busqueda', formatted);
+        } catch (e) {
+            socket.emit('resultados_busqueda', []);
+        }
     });
 
     socket.on('unirse_box', ({ sede, boxId }) => {
         const roomKey = `${sede}-${boxId}`;
-        console.log("➡️ Un usuario se unió a:", roomKey);
         socket.join(roomKey);
         socket.emit('estado_box_actualizado', getBoxState(sede, boxId));
     });
@@ -60,9 +63,10 @@ io.on('connection', (socket) => {
         const state = getBoxState(sede, boxId);
         const nuevaCancion = { ...cancion, agregadoPor: usuario };
 
+        // SIEMPRE metemos la canción a la lista visual (historial)
         state.playlist.push(nuevaCancion);
 
-        // Si no hay nada sonando, seleccionamos esta como la primera
+        // Si es la primera que se agrega, la hacemos sonar
         if (!state.cancionActual) {
             state.cancionActual = nuevaCancion;
             state.estadoReproduccion = 'playing';
@@ -80,7 +84,7 @@ io.on('connection', (socket) => {
         if (comando === 'pause') state.estadoReproduccion = 'paused';
 
         if (comando === 'next') {
-            // Avanzamos el índice sin hacer shift()
+            // Avanzamos el índice sin eliminar nada de la lista
             if (state.currentIndex < state.playlist.length - 1) {
                 state.currentIndex++;
                 state.cancionActual = state.playlist[state.currentIndex];
@@ -88,6 +92,7 @@ io.on('connection', (socket) => {
                 state.tiempoActual = 0;
             } else {
                 state.estadoReproduccion = 'idle';
+                state.cancionActual = null; // Volvemos a la pantalla de espera
             }
         }
 
