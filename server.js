@@ -30,6 +30,24 @@ function getBoxState(sede, boxId) {
 
 io.on('connection', (socket) => {
 
+    socket.on('admin_reiniciar_box', ({ sede, boxId }) => {
+        const roomKey = `${sede}-${boxId}`;
+        // Reseteamos el estado a cero
+        boxesState[roomKey] = {
+            sede, boxId,
+            estadoReproduccion: 'idle',
+            cancionActual: null,
+            playlist: [],
+            currentIndex: 0,
+            tiempoActual: 0
+        };
+        // Avisamos a los celulares que se reinició (para mostrar la alerta)
+        io.to(roomKey).emit('box_reiniciado');
+        // Mandamos el estado vacío a la TV y celulares
+        io.to(roomKey).emit('estado_box_actualizado', boxesState[roomKey]);
+    });
+
+
     socket.on('buscar_cancion', async ({ query }) => {
         try {
             const searchResults = await ytsr(query, { limit: 5 });
@@ -146,6 +164,10 @@ io.on('connection', (socket) => {
         if (comando === 'seek') {
             io.to(roomKey).emit('ejecutar_comando', { comando, valor });
         } else {
+
+
+
+
             io.to(roomKey).emit('estado_box_actualizado', state);
         }
     });
