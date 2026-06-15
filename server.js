@@ -3,25 +3,20 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const ytsr = require('ytsr');
-const rateLimit = require('express-rate-limit'); // NUEVO
+const rateLimit = require('express-rate-limit');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// CONFIGURACIÓN DEL LIMITADOR: Máximo 50 búsquedas cada 15 min por IP
-const limiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 50,
-    message: "Demasiadas peticiones, intenta más tarde."
-});
-app.use('/api/', limiter); // Aplicado a rutas de API
+const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 50 });
+app.use('/api/', limiter);
 
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } });
 
 const boxesState = {};
-const searchCache = {}; // NUEVO: Caché para resultados de YouTube
+const searchCache = {};
 
 function getBoxState(sede, boxId) {
     const roomKey = `${sede}-${boxId}`;
@@ -32,7 +27,6 @@ function getBoxState(sede, boxId) {
 }
 
 io.on('connection', (socket) => {
-
     socket.on('admin_reiniciar_box', ({ sede, boxId }) => {
         const roomKey = `${sede}-${boxId}`;
         boxesState[roomKey] = { sede, boxId, estadoReproduccion: 'idle', cancionActual: null, playlist: [], currentIndex: 0, tiempoActual: 0 };
@@ -40,21 +34,20 @@ io.on('connection', (socket) => {
         io.to(roomKey).emit('estado_box_actualizado', boxesState[roomKey]);
     });
 
-    // BÚSQUEDA OPTIMIZADA CON CACHÉ
     socket.on('buscar_cancion', async ({ query }) => {
         const cacheKey = query.toLowerCase().trim();
         if (searchCache[cacheKey] && (Date.now() - searchCache[cacheKey].timestamp < 3600000)) {
             socket.emit('resultados_busqueda', searchCache[cacheKey].results);
             return;
         }
-
         try {
             const searchResults = await ytsr(query, { limit: 5 });
             const formatted = searchResults.items.filter(item => item.type === 'video').map(item => ({
                 id: Math.random().toString(36),
                 title: item.title,
                 videoId: item.id,
-                thumbnail: item.bestThumbnail.url
+                thumbnail: item.bestThumbnail.url,
+                duration: item.duration // <-- AÑADIDO: Capturamos la duración
             }));
             searchCache[cacheKey] = { results: formatted, timestamp: Date.now() };
             socket.emit('resultados_busqueda', formatted);
@@ -106,19 +99,15 @@ io.on('connection', (socket) => {
     socket.on('comando_reproductor', ({ sede, boxId, comando, valor }) => {
         const roomKey = `${sede}-${boxId}`;
         const state = getBoxState(sede, boxId);
-
         if (comando === 'play') state.estadoReproduccion = 'playing';
         if (comando === 'pause') state.estadoReproduccion = 'paused';
-
         if (comando === 'next') {
             if (state.currentIndex < state.playlist.length - 1) { state.currentIndex++; state.cancionActual = state.playlist[state.currentIndex]; state.estadoReproduccion = 'playing'; state.tiempoActual = 0; }
             else { state.estadoReproduccion = 'idle'; state.cancionActual = null; }
         }
-
         if (comando === 'prev') {
             if (state.currentIndex > 0) { state.currentIndex--; state.cancionActual = state.playlist[state.currentIndex]; state.estadoReproduccion = 'playing'; state.tiempoActual = 0; }
         }
-
         if (comando === 'jump_to' && valor !== undefined) {
             if (valor >= 0 && valor < state.playlist.length) {
                 state.currentIndex = valor;
@@ -127,7 +116,6 @@ io.on('connection', (socket) => {
                 state.tiempoActual = 0;
             }
         }
-
         if (comando === 'seek' || comando === 'volumen') {
             io.to(roomKey).emit('ejecutar_comando', { comando, valor });
         } else {
@@ -136,12 +124,6 @@ io.on('connection', (socket) => {
     });
 });
 
-// HEARTBEAT: Mantiene vivo el servidor
-setInterval(() => {
-    console.log("Sopranos Heartbeat: Servidor activo...");
-}, 300000);
-
+setInterval(() => { console.log("Sopranos Heartbeat: Servidor activo..."); }, 300000);
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`Servidor activo en ${PORT}`));
-
-//Elias
