@@ -26,6 +26,14 @@ function getBoxState(sede, boxId) {
     return boxesState[roomKey];
 }
 
+function parseDuration(durationStr) {
+    if (!durationStr) return 0;
+    const parts = durationStr.split(':').map(Number);
+    if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2]; // HH:MM:SS
+    if (parts.length === 2) return parts[0] * 60 + parts[1]; // MM:SS
+    return parts[0]; // Segundos
+}
+
 io.on('connection', (socket) => {
     socket.on('admin_reiniciar_box', ({ sede, boxId }) => {
         const roomKey = `${sede}-${boxId}`;
@@ -47,11 +55,14 @@ io.on('connection', (socket) => {
                 title: item.title,
                 videoId: item.id,
                 thumbnail: item.bestThumbnail.url,
-                duration: item.duration // <-- AÑADIDO: Capturamos la duración
+                duration: parseDuration(item.duration) // AHORA ES UN NÚMERO
             }));
             searchCache[cacheKey] = { results: formatted, timestamp: Date.now() };
             socket.emit('resultados_busqueda', formatted);
-        } catch (e) { socket.emit('resultados_busqueda', []); }
+        } catch (e) {
+            console.error("Error buscando:", e);
+            socket.emit('resultados_busqueda', []);
+        }
     });
 
     socket.on('unirse_box', ({ sede, boxId }) => {
