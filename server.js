@@ -49,7 +49,7 @@ io.on('connection', (socket) => {
             return;
         }
         try {
-            // Buscamos con un limit más alto para tener de dónde elegir
+            // Buscamos con un limit más alto para tener margen tras filtrar
             const searchResults = await ytsr(query + " letra", { limit: 20 });
 
             const formatted = searchResults.items
@@ -58,23 +58,23 @@ io.on('connection', (socket) => {
                     const author = (item.author?.name || '').toLowerCase();
                     const title = (item.title || '').toLowerCase();
 
-                    // Lista negra de palabras que causan el error "No disponible"
+                    // Lista negra ampliada para bloquear LatinAutor y UMPG
                     const blackList = [
                         'vevo', 'official video', 'video oficial',
-                        'umg', 'sme', 'wmg', 'sonymusic', 'warnermusic'
+                        'umg', 'sme', 'wmg', 'sonymusic', 'warnermusic',
+                        'latinautor', 'umpg'
                     ];
 
                     const esBloqueado = blackList.some(word =>
                         author.includes(word) || title.includes(word)
                     );
 
-                    // Solo permitimos videos que NO tengan estas palabras
-                    // Y añadimos una validación extra: que la duración no sea extremadamente corta (evita intros rotas)
+                    // Filtro validado: no bloqueado y debe tener duración
                     const esValido = !esBloqueado && item.duration;
 
                     return esValido;
                 })
-                .slice(0, 5) // Tomamos los 5 más limpios
+                .slice(0, 5) // Solo los 5 mejores resultados limpios
                 .map(item => ({
                     id: Math.random().toString(36),
                     title: item.title,
