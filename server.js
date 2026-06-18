@@ -61,39 +61,52 @@ io.on('connection', (socket) => {
             socket.emit('resultados_busqueda', searchCache[cacheKey].results);
             return;
         }
-        try {
-            // Buscamos resultados
-            const searchResults = await ytsr(query + " letra", { limit: 12 });
-            const items = searchResults.items.filter(item => item.type === 'video');
 
-            // 🔥 FILTRO REAL: Verificamos uno por uno si YouTube permite incrustarlos
-            // Usamos Promise.all para que la validación sea rápida
-            const validItems = [];
-            for (const item of items) {
-                const esSeguro = await isVideoEmbeddable(item.id);
-                if (esSeguro) {
-                    validItems.push(item);
-                }
-                // Si ya encontramos 5 válidos, paramos para no saturar
-                if (validItems.length >= 5) break;
+        try {
+            // Buscamos con un limit razonable
+            const searchResults = await ytsr(query + " letra", { limit: 15 });
+
+            // 🔥 SEGURIDAD: Validar si existen items antes de filtrar
+            if (!searchResults || !searchResults.items) {
+                throw new Error("ytsr no devolvió resultados válidos");
             }
 
-            const formatted = validItems.map(item => ({
-                id: Math.random().toString(36),
-                title: item.title,
-                videoId: item.id,
-                thumbnail: item.bestThumbnail?.url || '',
-                duration: parseDuration(item.duration)
-            }));
+            const items = searchResults.items.filter(item => item.type === 'video');
+
+            const formatted = [];
+            // Filtramos y validamos uno a uno
+            for (const item of items) {
+                if (formatted.length >= 5) break; // Solo queremos 5 resultados
+
+                const author = (item.author?.name || '').toLowerCase();
+                const title = (item.title || '').toLowerCase();
+
+                // 1. Filtro agresivo de Palabras (Blacklist)
+                const blackList = ['vevo', 'official video', 'video oficial', 'official', 'umg', 'sme', 'wmg', 'sonymusic', 'warnermusic', 'latinautor', 'umpg', 'topic'];
+                const esBloqueado = blackList.some(word => author.includes(word) || title.includes(word));
+
+                if (esBloqueado) continue; // Si está en lista negra, lo saltamos
+
+                // 2. Verificación de red (OEmbed)
+                const esSeguro = await isVideoEmbeddable(item.id);
+                if (esSeguro) {
+                    formatted.push({
+                        id: Math.random().toString(36),
+                        title: item.title,
+                        videoId: item.id,
+                        thumbnail: item.bestThumbnail?.url || '',
+                        duration: parseDuration(item.duration)
+                    });
+                }
+            }
 
             searchCache[cacheKey] = { results: formatted, timestamp: Date.now() };
             socket.emit('resultados_busqueda', formatted);
         } catch (e) {
-            console.error("Error buscando:", e);
+            console.error("Error en búsqueda:", e.message);
             socket.emit('resultados_busqueda', []);
         }
     });
-
     socket.on('unirse_box', ({ sede, boxId }) => {
         const roomKey = `${sede}-${boxId}`;
         socket.join(roomKey);
