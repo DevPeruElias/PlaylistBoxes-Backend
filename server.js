@@ -49,36 +49,42 @@ io.on('connection', (socket) => {
             return;
         }
         try {
-            // 1. Buscamos 15 resultados para tener margen después de filtrar
-            const searchResults = await ytsr(query, { limit: 15 });
+            // 🔥 CANDADO 1: Forzamos la búsqueda de versiones "letra" o "lyrics"
+            // Si el usuario ya escribió "letra", no la duplicamos
+            const querySegura = cacheKey.includes('letra') || cacheKey.includes('karaoke')
+                ? query
+                : `${query} letra`;
+
+            // Buscamos 15 resultados usando la consulta modificada
+            const searchResults = await ytsr(querySegura, { limit: 15 });
 
             const formatted = searchResults.items
                 .filter(item => item.type === 'video')
-                // 🔥 FILTRO ANTI-BLOQUEOS (Sin usar API oficial)
+                // 🔥 CANDADO 2: FILTRO ANTI-BLOQUEOS
                 .filter(item => {
                     const channelName = (item.author?.name || '').toLowerCase();
                     const videoTitle = (item.title || '').toLowerCase();
 
-                    // Detectamos si es un canal VEVO o un video estrictamente oficial
+                    // Detectamos disqueras y videos oficiales
                     const esVevo = channelName.includes('vevo');
                     const esVideoOficial = videoTitle.includes('video oficial') || videoTitle.includes('official video');
 
-                    // Solo dejamos pasar los videos que NO sean VEVO y NO digan "video oficial"
+                    // Solo dejamos pasar videos limpios
                     return !esVevo && !esVideoOficial;
                 })
-                .slice(0, 5) // 2. Nos quedamos con los 5 mejores resultados sobrevivientes
+                .slice(0, 5) // Nos quedamos con los 5 mejores resultados seguros
                 .map(item => ({
                     id: Math.random().toString(36),
                     title: item.title,
                     videoId: item.id,
-                    thumbnail: item.bestThumbnail.url,
-                    duration: parseDuration(item.duration) // Tu función que ya los vuelve números
+                    thumbnail: item.bestThumbnail?.url || '',
+                    duration: parseDuration(item.duration)
                 }));
 
             searchCache[cacheKey] = { results: formatted, timestamp: Date.now() };
             socket.emit('resultados_busqueda', formatted);
         } catch (e) {
-            console.error("Error buscando:", e);
+            console.error("Error buscando:", e.message);
             socket.emit('resultados_busqueda', []);
         }
     });
