@@ -54,25 +54,24 @@ io.on('connection', (socket) => {
 
             const formatted = searchResults.items
                 .filter(item => item.type === 'video')
+
                 .filter(item => {
                     const author = (item.author?.name || '').toLowerCase();
                     const title = (item.title || '').toLowerCase();
 
-                    // Lista negra ampliada para bloquear LatinAutor y UMPG
+                    // Lista negra ultra-agresiva
                     const blackList = [
-                        'vevo', 'official video', 'video oficial',
+                        'vevo', 'official video', 'video oficial', 'official',
                         'umg', 'sme', 'wmg', 'sonymusic', 'warnermusic',
-                        'latinautor', 'umpg'
+                        'latinautor', 'umpg', 'topic', 'channel' // 'topic' y 'channel' eliminan canales oficiales
                     ];
 
                     const esBloqueado = blackList.some(word =>
                         author.includes(word) || title.includes(word)
                     );
 
-                    // Filtro validado: no bloqueado y debe tener duración
-                    const esValido = !esBloqueado && item.duration;
-
-                    return esValido;
+                    // Solo permitimos si NO está en la lista negra y es un video normal
+                    return !esBloqueado && item.duration;
                 })
                 .slice(0, 5) // Solo los 5 mejores resultados limpios
                 .map(item => ({
