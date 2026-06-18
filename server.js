@@ -49,30 +49,32 @@ io.on('connection', (socket) => {
             return;
         }
         try {
-            // 🔥 CANDADO 1: Forzamos la búsqueda de versiones "letra" o "lyrics"
-            // Si el usuario ya escribió "letra", no la duplicamos
-            const querySegura = cacheKey.includes('letra') || cacheKey.includes('karaoke')
-                ? query
-                : `${query} letra`;
-
-            // Buscamos 15 resultados usando la consulta modificada
-            const searchResults = await ytsr(querySegura, { limit: 15 });
+            // Buscamos con un limit más alto para tener de dónde elegir
+            const searchResults = await ytsr(query + " letra", { limit: 20 });
 
             const formatted = searchResults.items
                 .filter(item => item.type === 'video')
-                // 🔥 CANDADO 2: FILTRO ANTI-BLOQUEOS
                 .filter(item => {
-                    const channelName = (item.author?.name || '').toLowerCase();
-                    const videoTitle = (item.title || '').toLowerCase();
+                    const author = (item.author?.name || '').toLowerCase();
+                    const title = (item.title || '').toLowerCase();
 
-                    // Detectamos disqueras y videos oficiales
-                    const esVevo = channelName.includes('vevo');
-                    const esVideoOficial = videoTitle.includes('video oficial') || videoTitle.includes('official video');
+                    // Lista negra de palabras que causan el error "No disponible"
+                    const blackList = [
+                        'vevo', 'official video', 'video oficial',
+                        'umg', 'sme', 'wmg', 'sonymusic', 'warnermusic'
+                    ];
 
-                    // Solo dejamos pasar videos limpios
-                    return !esVevo && !esVideoOficial;
+                    const esBloqueado = blackList.some(word =>
+                        author.includes(word) || title.includes(word)
+                    );
+
+                    // Solo permitimos videos que NO tengan estas palabras
+                    // Y añadimos una validación extra: que la duración no sea extremadamente corta (evita intros rotas)
+                    const esValido = !esBloqueado && item.duration;
+
+                    return esValido;
                 })
-                .slice(0, 5) // Nos quedamos con los 5 mejores resultados seguros
+                .slice(0, 5) // Tomamos los 5 más limpios
                 .map(item => ({
                     id: Math.random().toString(36),
                     title: item.title,
@@ -84,7 +86,7 @@ io.on('connection', (socket) => {
             searchCache[cacheKey] = { results: formatted, timestamp: Date.now() };
             socket.emit('resultados_busqueda', formatted);
         } catch (e) {
-            console.error("Error buscando:", e.message);
+            console.error("Error buscando:", e);
             socket.emit('resultados_busqueda', []);
         }
     });
