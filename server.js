@@ -49,14 +49,32 @@ io.on('connection', (socket) => {
             return;
         }
         try {
-            const searchResults = await ytsr(query, { limit: 5 });
-            const formatted = searchResults.items.filter(item => item.type === 'video').map(item => ({
-                id: Math.random().toString(36),
-                title: item.title,
-                videoId: item.id,
-                thumbnail: item.bestThumbnail.url,
-                duration: parseDuration(item.duration) // AHORA ES UN NÚMERO
-            }));
+            // 1. Buscamos 15 resultados para tener margen después de filtrar
+            const searchResults = await ytsr(query, { limit: 15 });
+
+            const formatted = searchResults.items
+                .filter(item => item.type === 'video')
+                // 🔥 FILTRO ANTI-BLOQUEOS (Sin usar API oficial)
+                .filter(item => {
+                    const channelName = (item.author?.name || '').toLowerCase();
+                    const videoTitle = (item.title || '').toLowerCase();
+
+                    // Detectamos si es un canal VEVO o un video estrictamente oficial
+                    const esVevo = channelName.includes('vevo');
+                    const esVideoOficial = videoTitle.includes('video oficial') || videoTitle.includes('official video');
+
+                    // Solo dejamos pasar los videos que NO sean VEVO y NO digan "video oficial"
+                    return !esVevo && !esVideoOficial;
+                })
+                .slice(0, 5) // 2. Nos quedamos con los 5 mejores resultados sobrevivientes
+                .map(item => ({
+                    id: Math.random().toString(36),
+                    title: item.title,
+                    videoId: item.id,
+                    thumbnail: item.bestThumbnail.url,
+                    duration: parseDuration(item.duration) // Tu función que ya los vuelve números
+                }));
+
             searchCache[cacheKey] = { results: formatted, timestamp: Date.now() };
             socket.emit('resultados_busqueda', formatted);
         } catch (e) {
