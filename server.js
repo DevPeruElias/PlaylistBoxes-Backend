@@ -4,6 +4,7 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const ytsr = require('ytsr');
 const rateLimit = require('express-rate-limit');
+const axios = require('axios'); // Nueva dependencia necesaria
 
 const app = express();
 app.use(cors());
@@ -18,6 +19,18 @@ const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } 
 const boxesState = {};
 const searchCache = {};
 
+// Función para verificar si un video se puede insertar (reproducir)
+async function isVideoEmbeddable(videoId) {
+    try {
+        const url = `https://www.youtube.com/oembed?url=http://www.youtube.com/watch?v=${videoId}&format=json`;
+        const response = await axios.get(url);
+        return response.status === 200;
+    } catch (error) {
+        // Si hay error (403), el video está bloqueado
+        return false;
+    }
+}
+
 function getBoxState(sede, boxId) {
     const roomKey = `${sede}-${boxId}`;
     if (!boxesState[roomKey]) {
@@ -29,9 +42,9 @@ function getBoxState(sede, boxId) {
 function parseDuration(durationStr) {
     if (!durationStr) return 0;
     const parts = durationStr.split(':').map(Number);
-    if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2]; // HH:MM:SS
-    if (parts.length === 2) return parts[0] * 60 + parts[1]; // MM:SS
-    return parts[0]; // Segundos
+    if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+    if (parts.length === 2) return parts[0] * 60 + parts[1];
+    return parts[0];
 }
 
 io.on('connection', (socket) => {
@@ -49,38 +62,29 @@ io.on('connection', (socket) => {
             return;
         }
         try {
-            // Buscamos con un limit más alto para tener margen tras filtrar
-            const searchResults = await ytsr(query + " letra", { limit: 20 });
+            // Buscamos resultados
+            const searchResults = await ytsr(query + " letra", { limit: 12 });
+            const items = searchResults.items.filter(item => item.type === 'video');
 
-            const formatted = searchResults.items
-                .filter(item => item.type === 'video')
+            // 🔥 FILTRO REAL: Verificamos uno por uno si YouTube permite incrustarlos
+            // Usamos Promise.all para que la validación sea rápida
+            const validItems = [];
+            for (const item of items) {
+                const esSeguro = await isVideoEmbeddable(item.id);
+                if (esSeguro) {
+                    validItems.push(item);
+                }
+                // Si ya encontramos 5 válidos, paramos para no saturar
+                if (validItems.length >= 5) break;
+            }
 
-                .filter(item => {
-                    const author = (item.author?.name || '').toLowerCase();
-                    const title = (item.title || '').toLowerCase();
-
-                    // Lista negra ultra-agresiva
-                    const blackList = [
-                        'vevo', 'official video', 'video oficial', 'official',
-                        'umg', 'sme', 'wmg', 'sonymusic', 'warnermusic',
-                        'latinautor', 'umpg', 'topic', 'channel' // 'topic' y 'channel' eliminan canales oficiales
-                    ];
-
-                    const esBloqueado = blackList.some(word =>
-                        author.includes(word) || title.includes(word)
-                    );
-
-                    // Solo permitimos si NO está en la lista negra y es un video normal
-                    return !esBloqueado && item.duration;
-                })
-                .slice(0, 5) // Solo los 5 mejores resultados limpios
-                .map(item => ({
-                    id: Math.random().toString(36),
-                    title: item.title,
-                    videoId: item.id,
-                    thumbnail: item.bestThumbnail?.url || '',
-                    duration: parseDuration(item.duration)
-                }));
+            const formatted = validItems.map(item => ({
+                id: Math.random().toString(36),
+                title: item.title,
+                videoId: item.id,
+                thumbnail: item.bestThumbnail?.url || '',
+                duration: parseDuration(item.duration)
+            }));
 
             searchCache[cacheKey] = { results: formatted, timestamp: Date.now() };
             socket.emit('resultados_busqueda', formatted);
