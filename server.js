@@ -3,7 +3,8 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
-const { Innertube, UniversalCache } = require('youtubei.js'); // Agregado UniversalCache para que no se sature
+const ytsr = require('ytsr');
+const axios = require('axios');
 
 const app = express();
 app.use(cors());
@@ -18,13 +19,17 @@ const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } 
 const boxesState = {};
 const searchCache = {};
 
-// Inicializamos youtubei.js como una promesa global para evitar que peticiones tempranas crasheen
-const ytPromise = Innertube.create({ cache: new UniversalCache(false) });
-ytPromise.then(() => {
-    console.log("✅ youtubei.js inicializado correctamente. Conectado a la API interna de YouTube.");
-}).catch(err => {
-    console.error("❌ Error iniciando youtubei.js:", err);
-});
+// 🔥 Función rápida para preguntar a YouTube si el video tiene bloqueos
+async function isVideoEmbeddable(videoId) {
+    try {
+        const url = `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`;
+        // Le damos máximo 3 segundos para responder, si no, lo descartamos
+        const response = await axios.get(url, { timeout: 3000 });
+        return response.status === 200;
+    } catch (error) {
+        return false; // Si responde 403 o error, está bloqueado (LatinAutor, etc.)
+    }
+}
 
 function getBoxState(sede, boxId) {
     const roomKey = `${sede}-${boxId}`;
@@ -37,9 +42,9 @@ function getBoxState(sede, boxId) {
 function parseDuration(durationStr) {
     if (!durationStr) return 0;
     const parts = durationStr.split(':').map(Number);
-    if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2]; // HH:MM:SS
-    if (parts.length === 2) return parts[0] * 60 + parts[1]; // MM:SS
-    return parts[0]; // Segundos
+    if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+    if (parts.length === 2) return parts[0] * 60 + parts[1];
+    return parts[0];
 }
 
 io.on('connection', (socket) => {
@@ -58,48 +63,53 @@ io.on('connection', (socket) => {
         }
 
         try {
-            // Esperamos que youtubei.js esté listo
-            const yt = await ytPromise;
+            // 1. Buscamos en YouTube
+            const searchResults = await ytsr(query + " letra", { limit: 12 });
 
-            // Buscamos resultados
-            const search = await yt.search(query + " letra", { type: 'video' });
+            // Protección por si YouTube no devuelve nada
+            if (!searchResults || !searchResults.items) {
+                socket.emit('resultados_busqueda', []);
+                return;
+            }
 
-            // Compatibilidad de estructura
-            const items = search.videos || search.results || [];
+            const items = searchResults.items.filter(item => item.type === 'video');
+            const candidates = items.slice(0, 8); // Tomamos 8 candidatos rápidos
 
-            // 🔥 CAMBIO CLAVE: Tomamos EXACTAMENTE los primeros 5 resultados y nada más.
-            const candidates = items.slice(0, 5);
+            // 2. PARALELISMO: Verificamos los 8 videos al mismo tiempo
+            const validaciones = candidates.map(async (item) => {
+                const author = (item.author?.name || '').toLowerCase();
+                const title = (item.title || '').toLowerCase();
 
-            // Verificamos los 5 al mismo tiempo para que sea rapidísimo (concurrencia)
-            const validaciones = candidates.map(async (video) => {
-                try {
-                    const info = await yt.getBasicInfo(video.id);
-                    const playability = info.playability_status;
+                // Filtro agresivo de disqueras
+                const blackList = ['vevo', 'official video', 'video oficial', 'official', 'umg', 'sme', 'wmg', 'sonymusic', 'warnermusic', 'latinautor', 'umpg', 'topic'];
+                if (blackList.some(word => author.includes(word) || title.includes(word))) {
+                    return null; // Lo descartamos directo si tiene estas palabras
+                }
 
-                    if (playability && playability.status === 'OK') {
-                        return {
-                            id: Math.random().toString(36),
-                            title: video.title?.text || video.title || 'Sin título',
-                            videoId: video.id,
-                            thumbnail: video.best_thumbnail?.url || video.thumbnails?.[0]?.url || '',
-                            duration: parseDuration(video.duration?.text || "0:00")
-                        };
-                    }
-                } catch (errorValidacion) {
-                    return null; // Si este video falla la verificación, lo marcamos como nulo
+                // Filtro OEmbed de YouTube (Detecta bloqueos de inserción)
+                const esSeguro = await isVideoEmbeddable(item.id);
+                if (esSeguro) {
+                    return {
+                        id: Math.random().toString(36),
+                        title: item.title,
+                        videoId: item.id,
+                        thumbnail: item.bestThumbnail?.url || '',
+                        duration: parseDuration(item.duration)
+                    };
                 }
                 return null;
             });
 
-            // Esperamos a que los 5 terminen su consulta simultánea y filtramos los bloqueados
-            const validItems = (await Promise.all(validaciones)).filter(item => item !== null);
+            // 3. Juntamos los resultados válidos y enviamos exactamente 5 al celular
+            const resolved = await Promise.all(validaciones);
+            const validItems = resolved.filter(i => i !== null).slice(0, 5);
 
             searchCache[cacheKey] = { results: validItems, timestamp: Date.now() };
             socket.emit('resultados_busqueda', validItems);
 
         } catch (e) {
-            console.error("Error crítico en búsqueda:", e.message);
-            socket.emit('resultados_busqueda', []);
+            console.error("Error en búsqueda:", e.message);
+            socket.emit('resultados_busqueda', []); // Evita que el celular se quede pensando para siempre
         }
     });
 
@@ -176,7 +186,3 @@ io.on('connection', (socket) => {
 setInterval(() => { console.log("Sopranos Heartbeat: Servidor activo..."); }, 300000);
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`Servidor activo en ${PORT}`));
-
-
-
-//Elias
