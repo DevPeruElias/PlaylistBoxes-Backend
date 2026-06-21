@@ -3,8 +3,7 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
-const ytsr = require('ytsr');
-const { Innertube, UniversalCache } = require('youtubei.js');
+const axios = require('axios'); // Usaremos axios para conectarnos a RapidAPI
 
 const app = express();
 app.use(cors());
@@ -19,14 +18,45 @@ const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } 
 const boxesState = {};
 const searchCache = {};
 
-// 🔥 Inicializamos youtubei.js SOLO como Escáner de Validación
-let yt;
-Innertube.create({ cache: new UniversalCache(false) })
-    .then(instance => {
-        yt = instance;
-        console.log("✅ youtubei.js inicializado (Escáner activo)");
-    })
-    .catch(err => console.error("❌ Error en youtubei.js:", err));
+// 🔥 LA RULETA DE CLAVES (API KEY ROULETTE)
+// Pon aquí todas las claves de RapidAPI gratuitas que saques con diferentes correos.
+const rapidApiKeys = [
+    '806211e9ddmsh1d9355388fa1730p1cbd55jsn5db96e477194',
+    '1867ec7d0bmshe65e9278e5d85f8p1fa071jsn893f8bf3afc9',
+    'd7cced8d2amshf6f8a3a24ab24cbp1cf0b2jsnae7e58d83b08'
+];
+let currentKeyIndex = 0;
+
+// Función inteligente que busca y rota la clave si se acaba la cuota
+async function buscarEnRapidAPI(query, retries = 0) {
+    if (retries >= rapidApiKeys.length) {
+        throw new Error("Todas las API Keys gratuitas se han quedado sin cuota esta noche.");
+    }
+
+    const currentKey = rapidApiKeys[currentKeyIndex];
+    const options = {
+        method: 'GET',
+        url: 'https://youtube138.p.rapidapi.com/search/',
+        params: { q: query, hl: 'es', gl: 'PE' },
+        headers: {
+            'X-RapidAPI-Key': currentKey,
+            'X-RapidAPI-Host': 'youtube138.p.rapidapi.com'
+        }
+    };
+
+    try {
+        const response = await axios.request(options);
+        return response.data;
+    } catch (error) {
+        // Códigos 429 o 403 significan que se acabó la cuota de la cuenta actual
+        if (error.response && (error.response.status === 429 || error.response.status === 403)) {
+            console.warn(`Límite alcanzado en la clave ${currentKeyIndex + 1}. Rotando a la siguiente clave...`);
+            currentKeyIndex = (currentKeyIndex + 1) % rapidApiKeys.length;
+            return buscarEnRapidAPI(query, retries + 1); // Reintenta con la nueva clave automáticamente
+        }
+        throw error;
+    }
+}
 
 function getBoxState(sede, boxId) {
     const roomKey = `${sede}-${boxId}`;
@@ -34,14 +64,6 @@ function getBoxState(sede, boxId) {
         boxesState[roomKey] = { sede, boxId, estadoReproduccion: 'idle', cancionActual: null, playlist: [], currentIndex: 0, tiempoActual: 0 };
     }
     return boxesState[roomKey];
-}
-
-function parseDuration(durationStr) {
-    if (!durationStr) return 0;
-    const parts = durationStr.split(':').map(Number);
-    if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
-    if (parts.length === 2) return parts[0] * 60 + parts[1];
-    return parts[0];
 }
 
 io.on('connection', (socket) => {
@@ -60,64 +82,42 @@ io.on('connection', (socket) => {
         }
 
         try {
-            // 1. Buscamos con ytsr (Es más resistente a los bloqueos de IPs de Render)
-            const searchResults = await ytsr(query + " letra", { limit: 12 });
+            // Buscamos forzando la palabra "letra" para evadir videos oficiales
+            const data = await buscarEnRapidAPI(query + " letra");
 
-            if (!searchResults || !searchResults.items) {
+            if (!data || !data.contents) {
                 socket.emit('resultados_busqueda', []);
                 return;
             }
 
-            let items = searchResults.items.filter(item => item.type === 'video');
+            // Extraemos solo los que son videos
+            let items = data.contents.filter(item => item.video);
 
-            // 2. Filtro de texto previo (Para no hacerle escaneos innecesarios a VEVO y gastar peticiones)
+            // 🔥 FILTRO EXTERMINADOR LOCAL
+            // Eliminamos disqueras y videos oficiales que RapidAPI haya dejado pasar
             const blackList = ['vevo', 'official video', 'video oficial', 'official', 'umg', 'sme', 'wmg', 'sonymusic', 'warnermusic', 'latinautor', 'umpg', 'topic'];
-            items = items.filter(item => {
-                const author = (item.author?.name || '').toLowerCase();
-                const title = (item.title || '').toLowerCase();
-                return !blackList.some(word => author.includes(word) || title.includes(word));
-            });
 
-            // Tomamos 8 candidatos para escanearlos
-            const candidates = items.slice(0, 8);
-
-            // 🔥 3. ESCÁNER ABSOLUTO CON YOUTUBEI.JS
-            const validaciones = candidates.map(async (item) => {
-                if (!yt) return null; // Si el escáner no cargó, lo ignoramos
-
-                try {
-                    // Extraemos los metadatos reales de los servidores de YouTube
-                    const info = await yt.getBasicInfo(item.id);
-                    const status = info.playability_status?.status;
-
-                    // Si YouTube dice 'OK', el video no tiene ningún bloqueo para tu TV
-                    if (status === 'OK') {
-                        return {
-                            id: Math.random().toString(36),
-                            title: item.title,
-                            videoId: item.id,
-                            thumbnail: item.bestThumbnail?.url || '',
-                            duration: parseDuration(item.duration)
-                        };
-                    } else {
-                        // Si es UNPLAYABLE o tiene restricción, lo matamos aquí mismo
-                        console.log(`❌ Bloqueado por YouTube: ${item.title} (${status})`);
-                        return null;
-                    }
-                } catch (error) {
-                    return null; // Si hay error de conexión, asumimos que está bloqueado
-                }
-            });
-
-            // 4. Juntamos todo en paralelo
-            const resolved = await Promise.all(validaciones);
-            const validItems = resolved.filter(i => i !== null).slice(0, 5);
+            const validItems = items.filter(item => {
+                const author = (item.video.author?.title || '').toLowerCase();
+                const title = (item.video.title || '').toLowerCase();
+                const esBloqueado = blackList.some(word => author.includes(word) || title.includes(word));
+                return !esBloqueado;
+            })
+                .slice(0, 5) // Tomamos los 5 mejores limpios
+                .map(item => ({
+                    id: Math.random().toString(36),
+                    title: item.video.title,
+                    videoId: item.video.videoId,
+                    thumbnail: item.video.thumbnails && item.video.thumbnails.length > 0 ? item.video.thumbnails[0].url : '',
+                    // RapidAPI youtube138 devuelve los segundos directos en lengthSeconds
+                    duration: parseInt(item.video.lengthSeconds) || 0
+                }));
 
             searchCache[cacheKey] = { results: validItems, timestamp: Date.now() };
             socket.emit('resultados_busqueda', validItems);
 
         } catch (e) {
-            console.error("Error en búsqueda híbrida:", e.message);
+            console.error("Error en búsqueda con RapidAPI:", e.message);
             socket.emit('resultados_busqueda', []);
         }
     });
