@@ -4,7 +4,7 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const ytsr = require('ytsr');
-const axios = require('axios');
+const { Innertube, UniversalCache } = require('youtubei.js');
 
 const app = express();
 app.use(cors());
@@ -19,17 +19,14 @@ const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } 
 const boxesState = {};
 const searchCache = {};
 
-// 🔥 Función rápida para preguntar a YouTube si el video tiene bloqueos
-async function isVideoEmbeddable(videoId) {
-    try {
-        const url = `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`;
-        // Le damos máximo 3 segundos para responder, si no, lo descartamos
-        const response = await axios.get(url, { timeout: 3000 });
-        return response.status === 200;
-    } catch (error) {
-        return false; // Si responde 403 o error, está bloqueado (LatinAutor, etc.)
-    }
-}
+// 🔥 Inicializamos youtubei.js SOLO como Escáner de Validación
+let yt;
+Innertube.create({ cache: new UniversalCache(false) })
+    .then(instance => {
+        yt = instance;
+        console.log("✅ youtubei.js inicializado (Escáner activo)");
+    })
+    .catch(err => console.error("❌ Error en youtubei.js:", err));
 
 function getBoxState(sede, boxId) {
     const roomKey = `${sede}-${boxId}`;
@@ -63,44 +60,56 @@ io.on('connection', (socket) => {
         }
 
         try {
-            // 1. Buscamos en YouTube
+            // 1. Buscamos con ytsr (Es más resistente a los bloqueos de IPs de Render)
             const searchResults = await ytsr(query + " letra", { limit: 12 });
 
-            // Protección por si YouTube no devuelve nada
             if (!searchResults || !searchResults.items) {
                 socket.emit('resultados_busqueda', []);
                 return;
             }
 
-            const items = searchResults.items.filter(item => item.type === 'video');
-            const candidates = items.slice(0, 8); // Tomamos 8 candidatos rápidos
+            let items = searchResults.items.filter(item => item.type === 'video');
 
-            // 2. PARALELISMO: Verificamos los 8 videos al mismo tiempo
-            const validaciones = candidates.map(async (item) => {
+            // 2. Filtro de texto previo (Para no hacerle escaneos innecesarios a VEVO y gastar peticiones)
+            const blackList = ['vevo', 'official video', 'video oficial', 'official', 'umg', 'sme', 'wmg', 'sonymusic', 'warnermusic', 'latinautor', 'umpg', 'topic'];
+            items = items.filter(item => {
                 const author = (item.author?.name || '').toLowerCase();
                 const title = (item.title || '').toLowerCase();
-
-                // Filtro agresivo de disqueras
-                const blackList = ['vevo', 'official video', 'video oficial', 'official', 'umg', 'sme', 'wmg', 'sonymusic', 'warnermusic', 'latinautor', 'umpg', 'topic'];
-                if (blackList.some(word => author.includes(word) || title.includes(word))) {
-                    return null; // Lo descartamos directo si tiene estas palabras
-                }
-
-                // Filtro OEmbed de YouTube (Detecta bloqueos de inserción)
-                const esSeguro = await isVideoEmbeddable(item.id);
-                if (esSeguro) {
-                    return {
-                        id: Math.random().toString(36),
-                        title: item.title,
-                        videoId: item.id,
-                        thumbnail: item.bestThumbnail?.url || '',
-                        duration: parseDuration(item.duration)
-                    };
-                }
-                return null;
+                return !blackList.some(word => author.includes(word) || title.includes(word));
             });
 
-            // 3. Juntamos los resultados válidos y enviamos exactamente 5 al celular
+            // Tomamos 8 candidatos para escanearlos
+            const candidates = items.slice(0, 8);
+
+            // 🔥 3. ESCÁNER ABSOLUTO CON YOUTUBEI.JS
+            const validaciones = candidates.map(async (item) => {
+                if (!yt) return null; // Si el escáner no cargó, lo ignoramos
+
+                try {
+                    // Extraemos los metadatos reales de los servidores de YouTube
+                    const info = await yt.getBasicInfo(item.id);
+                    const status = info.playability_status?.status;
+
+                    // Si YouTube dice 'OK', el video no tiene ningún bloqueo para tu TV
+                    if (status === 'OK') {
+                        return {
+                            id: Math.random().toString(36),
+                            title: item.title,
+                            videoId: item.id,
+                            thumbnail: item.bestThumbnail?.url || '',
+                            duration: parseDuration(item.duration)
+                        };
+                    } else {
+                        // Si es UNPLAYABLE o tiene restricción, lo matamos aquí mismo
+                        console.log(`❌ Bloqueado por YouTube: ${item.title} (${status})`);
+                        return null;
+                    }
+                } catch (error) {
+                    return null; // Si hay error de conexión, asumimos que está bloqueado
+                }
+            });
+
+            // 4. Juntamos todo en paralelo
             const resolved = await Promise.all(validaciones);
             const validItems = resolved.filter(i => i !== null).slice(0, 5);
 
@@ -108,8 +117,8 @@ io.on('connection', (socket) => {
             socket.emit('resultados_busqueda', validItems);
 
         } catch (e) {
-            console.error("Error en búsqueda:", e.message);
-            socket.emit('resultados_busqueda', []); // Evita que el celular se quede pensando para siempre
+            console.error("Error en búsqueda híbrida:", e.message);
+            socket.emit('resultados_busqueda', []);
         }
     });
 
