@@ -2,9 +2,8 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
-const ytsr = require('ytsr');
 const rateLimit = require('express-rate-limit');
-const axios = require('axios'); // Nueva dependencia necesaria
+const { Innertube } = require('youtubei.js'); // 🔥 Nueva librería importada
 
 const app = express();
 app.use(cors());
@@ -19,17 +18,14 @@ const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } 
 const boxesState = {};
 const searchCache = {};
 
-// Función para verificar si un video se puede insertar (reproducir)
-async function isVideoEmbeddable(videoId) {
-    try {
-        const url = `https://www.youtube.com/oembed?url=http://www.youtube.com/watch?v=${videoId}&format=json`;
-        const response = await axios.get(url);
-        return response.status === 200;
-    } catch (error) {
-        // Si hay error (403), el video está bloqueado
-        return false;
-    }
-}
+// Inicializamos youtubei.js (Innertube) de forma global
+let yt;
+Innertube.create().then(innertube => {
+    yt = innertube;
+    console.log("✅ youtubei.js inicializado correctamente. Conectado a la API interna de YouTube.");
+}).catch(err => {
+    console.error("❌ Error iniciando youtubei.js:", err);
+});
 
 function getBoxState(sede, boxId) {
     const roomKey = `${sede}-${boxId}`;
@@ -42,9 +38,9 @@ function getBoxState(sede, boxId) {
 function parseDuration(durationStr) {
     if (!durationStr) return 0;
     const parts = durationStr.split(':').map(Number);
-    if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
-    if (parts.length === 2) return parts[0] * 60 + parts[1];
-    return parts[0];
+    if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2]; // HH:MM:SS
+    if (parts.length === 2) return parts[0] * 60 + parts[1]; // MM:SS
+    return parts[0]; // Segundos
 }
 
 io.on('connection', (socket) => {
@@ -61,35 +57,53 @@ io.on('connection', (socket) => {
             socket.emit('resultados_busqueda', searchCache[cacheKey].results);
             return;
         }
-        try {
-            // Buscamos resultados
-            const searchResults = await ytsr(query + " letra", { limit: 12 });
-            const items = searchResults.items.filter(item => item.type === 'video');
 
-            // 🔥 FILTRO REAL: Verificamos uno por uno si YouTube permite incrustarlos
-            // Usamos Promise.all para que la validación sea rápida
+        // Si la librería aún no ha terminado de cargar, devolvemos vacío para no crashear
+        if (!yt) {
+            socket.emit('resultados_busqueda', []);
+            return;
+        }
+
+        try {
+            // 🔥 Buscamos directamente con youtubei.js
+            const search = await yt.search(query + " letra", { type: 'video' });
+
             const validItems = [];
-            for (const item of items) {
-                const esSeguro = await isVideoEmbeddable(item.id);
-                if (esSeguro) {
-                    validItems.push(item);
+            // Tomamos los primeros 15 resultados para evaluarlos
+            const candidates = search.videos.slice(0, 15);
+
+            for (const video of candidates) {
+                try {
+                    // Extraemos la información básica del video desde los servidores de YouTube
+                    const info = await yt.getBasicInfo(video.id);
+                    const playability = info.playability_status;
+
+                    // VALIDACIÓN ABSOLUTA: Si el status es 'OK', el video no tiene bloqueos de derechos de autor ni región
+                    if (playability && playability.status === 'OK') {
+                        validItems.push({
+                            id: Math.random().toString(36),
+                            // youtubei.js guarda el título en un objeto, usamos .text
+                            title: video.title.text || video.title,
+                            videoId: video.id,
+                            thumbnail: video.best_thumbnail?.url || video.thumbnails?.[0]?.url || '',
+                            // La duración suele venir como texto "3:45" en youtubei.js
+                            duration: parseDuration(video.duration?.text || "0:00")
+                        });
+                    }
+                } catch (errorValidacion) {
+                    // Si un video en específico falla al verificarlo, lo ignoramos y seguimos con el siguiente
+                    console.log(`Saltando video ${video.id} por restricciones.`);
                 }
-                // Si ya encontramos 5 válidos, paramos para no saturar
+
+                // En cuanto tengamos 5 videos 100% seguros, cortamos el ciclo para responder rápido al cliente
                 if (validItems.length >= 5) break;
             }
 
-            const formatted = validItems.map(item => ({
-                id: Math.random().toString(36),
-                title: item.title,
-                videoId: item.id,
-                thumbnail: item.bestThumbnail?.url || '',
-                duration: parseDuration(item.duration)
-            }));
+            searchCache[cacheKey] = { results: validItems, timestamp: Date.now() };
+            socket.emit('resultados_busqueda', validItems);
 
-            searchCache[cacheKey] = { results: formatted, timestamp: Date.now() };
-            socket.emit('resultados_busqueda', formatted);
         } catch (e) {
-            console.error("Error buscando:", e);
+            console.error("Error crítico en búsqueda:", e.message);
             socket.emit('resultados_busqueda', []);
         }
     });
