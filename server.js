@@ -3,7 +3,8 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
-const axios = require('axios'); // Usaremos axios para conectarnos a RapidAPI y a OEmbed
+const ytsr = require('ytsr'); // Volvemos a ytsr, gratis y sin límites de cuota
+const axios = require('axios');
 
 const app = express();
 app.use(cors());
@@ -18,54 +19,13 @@ const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } 
 const boxesState = {};
 const searchCache = {};
 
-// 🔥 LA RULETA DE CLAVES (API KEY ROULETTE)
-const rapidApiKeys = [
-    '806211e9ddmsh1d9355388fa1730p1cbd55jsn5db96e477194',
-    '1867ec7d0bmshe65e9278e5d85f8p1fa071jsn893f8bf3afc9',
-    'd7cced8d2amshf6f8a3a24ab24cbp1cf0b2jsnae7e58d83b08'
-];
-let currentKeyIndex = 0;
-
-// Función inteligente que busca y rota la clave si se acaba la cuota
-async function buscarEnRapidAPI(query, retries = 0) {
-    if (retries >= rapidApiKeys.length) {
-        throw new Error("Todas las API Keys gratuitas se han quedado sin cuota esta noche.");
-    }
-
-    const currentKey = rapidApiKeys[currentKeyIndex];
-    const options = {
-        method: 'GET',
-        url: 'https://youtube138.p.rapidapi.com/search/',
-        params: { q: query, hl: 'es', gl: 'PE' },
-        headers: {
-            'X-RapidAPI-Key': currentKey,
-            'X-RapidAPI-Host': 'youtube138.p.rapidapi.com'
-        }
-    };
-
-    try {
-        const response = await axios.request(options);
-        return response.data;
-    } catch (error) {
-        // Códigos 429 o 403 significan que se acabó la cuota de la cuenta actual
-        if (error.response && (error.response.status === 429 || error.response.status === 403)) {
-            console.warn(`Límite alcanzado en la clave ${currentKeyIndex + 1}. Rotando a la siguiente clave...`);
-            currentKeyIndex = (currentKeyIndex + 1) % rapidApiKeys.length;
-            return buscarEnRapidAPI(query, retries + 1); // Reintenta con la nueva clave automáticamente
-        }
-        throw error;
-    }
-}
-
-// 🔥 ESCÁNER DE INSERCIÓN (Mata el error "Ver en YouTube")
+// ESCÁNER DE SEGURIDAD (Por si se cuela algo bloqueado)
 async function isVideoEmbeddable(videoId) {
     try {
         const url = `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`;
-        // Si responde 200 OK, el creador permite inserción
         await axios.get(url, { timeout: 3000 });
         return true;
     } catch (error) {
-        // Si responde un error (401/403/404), el creador prohibió la inserción
         return false;
     }
 }
@@ -94,46 +54,45 @@ io.on('connection', (socket) => {
         }
 
         try {
-            // Buscamos forzando la palabra "letra" para evadir videos oficiales
-            const data = await buscarEnRapidAPI(query + " letra");
+            // 🔥 EL PIVOTE A ROCOLA: Forzamos la búsqueda estricta de Karaokes
+            const queryRocola = query.trim() + " karaoke";
 
-            if (!data || !data.contents) {
+            // Buscamos 10 resultados usando ytsr
+            const searchResults = await ytsr(queryRocola, { limit: 10 });
+
+            if (!searchResults || !searchResults.items) {
                 socket.emit('resultados_busqueda', []);
                 return;
             }
 
-            // Extraemos solo los que son videos
-            let items = data.contents.filter(item => item.video);
+            let items = searchResults.items.filter(item => item.type === 'video');
 
-            // 1. FILTRO EXTERMINADOR DE TEXTO (Limpia disqueras evidentes)
-            const blackList = ['vevo', 'official video', 'video oficial', 'official', 'umg', 'sme', 'wmg', 'sonymusic', 'warnermusic', 'latinautor', 'umpg', 'topic'];
+            // Filtramos todo lo que parezca oficial
+            const blackList = ['vevo', 'official video', 'video oficial', 'official', 'umg', 'sme', 'wmg', 'sonymusic', 'warnermusic', 'topic'];
 
             let preFilteredItems = items.filter(item => {
-                const author = (item.video.author?.title || '').toLowerCase();
-                const title = (item.video.title || '').toLowerCase();
-                const esBloqueado = blackList.some(word => author.includes(word) || title.includes(word));
-                return !esBloqueado;
+                const author = (item.author?.name || '').toLowerCase();
+                const title = (item.title || '').toLowerCase();
+                return !blackList.some(word => author.includes(word) || title.includes(word));
             });
 
-            // Tomamos los primeros 8 sobrevivientes para el escáner profundo
             const candidates = preFilteredItems.slice(0, 8);
 
-            // 2. ESCÁNER DE INSERCIÓN EN PARALELO (Mata los bloqueos silenciosos)
+            // Verificamos que se puedan reproducir en la TV
             const validaciones = candidates.map(async (item) => {
-                const esSeguro = await isVideoEmbeddable(item.video.videoId);
+                const esSeguro = await isVideoEmbeddable(item.id);
                 if (esSeguro) {
                     return {
                         id: Math.random().toString(36),
-                        title: item.video.title,
-                        videoId: item.video.videoId,
-                        thumbnail: item.video.thumbnails && item.video.thumbnails.length > 0 ? item.video.thumbnails[0].url : '',
-                        duration: parseInt(item.video.lengthSeconds) || 0
+                        title: item.title,
+                        videoId: item.id,
+                        thumbnail: item.bestThumbnail?.url || '',
+                        duration: parseDuration(item.duration)
                     };
                 }
-                return null; // El video exigía verse directo en YouTube
+                return null;
             });
 
-            // Juntamos resultados y despachamos los 5 ganadores absolutos
             const resolved = await Promise.all(validaciones);
             const validItems = resolved.filter(i => i !== null).slice(0, 5);
 
@@ -141,10 +100,18 @@ io.on('connection', (socket) => {
             socket.emit('resultados_busqueda', validItems);
 
         } catch (e) {
-            console.error("Error en búsqueda con RapidAPI:", e.message);
+            console.error("Error en búsqueda Rocola:", e.message);
             socket.emit('resultados_busqueda', []);
         }
     });
+
+    function parseDuration(durationStr) {
+        if (!durationStr) return 0;
+        const parts = durationStr.split(':').map(Number);
+        if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+        if (parts.length === 2) return parts[0] * 60 + parts[1];
+        return parts[0];
+    }
 
     socket.on('unirse_box', ({ sede, boxId }) => {
         const roomKey = `${sede}-${boxId}`;
