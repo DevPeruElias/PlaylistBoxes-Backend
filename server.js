@@ -3,7 +3,7 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
-const { Innertube } = require('youtubei.js'); // 🔥 Nueva librería importada
+const { Innertube, UniversalCache } = require('youtubei.js'); // Agregado UniversalCache para que no se sature
 
 const app = express();
 app.use(cors());
@@ -18,10 +18,9 @@ const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } 
 const boxesState = {};
 const searchCache = {};
 
-// Inicializamos youtubei.js (Innertube) de forma global
-let yt;
-Innertube.create().then(innertube => {
-    yt = innertube;
+// Inicializamos youtubei.js como una promesa global para evitar que peticiones tempranas crasheen
+const ytPromise = Innertube.create({ cache: new UniversalCache(false) });
+ytPromise.then(() => {
     console.log("✅ youtubei.js inicializado correctamente. Conectado a la API interna de YouTube.");
 }).catch(err => {
     console.error("❌ Error iniciando youtubei.js:", err);
@@ -58,46 +57,42 @@ io.on('connection', (socket) => {
             return;
         }
 
-        // Si la librería aún no ha terminado de cargar, devolvemos vacío para no crashear
-        if (!yt) {
-            socket.emit('resultados_busqueda', []);
-            return;
-        }
-
         try {
-            // 🔥 Buscamos directamente con youtubei.js
+            // Esperamos que youtubei.js esté listo
+            const yt = await ytPromise;
+
+            // Buscamos resultados
             const search = await yt.search(query + " letra", { type: 'video' });
 
-            const validItems = [];
-            // Tomamos los primeros 15 resultados para evaluarlos
-            const candidates = search.videos.slice(0, 15);
+            // Compatibilidad de estructura
+            const items = search.videos || search.results || [];
 
-            for (const video of candidates) {
+            // 🔥 CAMBIO CLAVE: Tomamos EXACTAMENTE los primeros 5 resultados y nada más.
+            const candidates = items.slice(0, 5);
+
+            // Verificamos los 5 al mismo tiempo para que sea rapidísimo (concurrencia)
+            const validaciones = candidates.map(async (video) => {
                 try {
-                    // Extraemos la información básica del video desde los servidores de YouTube
                     const info = await yt.getBasicInfo(video.id);
                     const playability = info.playability_status;
 
-                    // VALIDACIÓN ABSOLUTA: Si el status es 'OK', el video no tiene bloqueos de derechos de autor ni región
                     if (playability && playability.status === 'OK') {
-                        validItems.push({
+                        return {
                             id: Math.random().toString(36),
-                            // youtubei.js guarda el título en un objeto, usamos .text
-                            title: video.title.text || video.title,
+                            title: video.title?.text || video.title || 'Sin título',
                             videoId: video.id,
                             thumbnail: video.best_thumbnail?.url || video.thumbnails?.[0]?.url || '',
-                            // La duración suele venir como texto "3:45" en youtubei.js
                             duration: parseDuration(video.duration?.text || "0:00")
-                        });
+                        };
                     }
                 } catch (errorValidacion) {
-                    // Si un video en específico falla al verificarlo, lo ignoramos y seguimos con el siguiente
-                    console.log(`Saltando video ${video.id} por restricciones.`);
+                    return null; // Si este video falla la verificación, lo marcamos como nulo
                 }
+                return null;
+            });
 
-                // En cuanto tengamos 5 videos 100% seguros, cortamos el ciclo para responder rápido al cliente
-                if (validItems.length >= 5) break;
-            }
+            // Esperamos a que los 5 terminen su consulta simultánea y filtramos los bloqueados
+            const validItems = (await Promise.all(validaciones)).filter(item => item !== null);
 
             searchCache[cacheKey] = { results: validItems, timestamp: Date.now() };
             socket.emit('resultados_busqueda', validItems);
