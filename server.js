@@ -3,7 +3,7 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
-const axios = require('axios'); // Usaremos axios para conectarnos a RapidAPI
+const axios = require('axios'); // Usaremos axios para conectarnos a RapidAPI y a OEmbed
 
 const app = express();
 app.use(cors());
@@ -19,7 +19,6 @@ const boxesState = {};
 const searchCache = {};
 
 // 🔥 LA RULETA DE CLAVES (API KEY ROULETTE)
-// Pon aquí todas las claves de RapidAPI gratuitas que saques con diferentes correos.
 const rapidApiKeys = [
     '806211e9ddmsh1d9355388fa1730p1cbd55jsn5db96e477194',
     '1867ec7d0bmshe65e9278e5d85f8p1fa071jsn893f8bf3afc9',
@@ -58,6 +57,19 @@ async function buscarEnRapidAPI(query, retries = 0) {
     }
 }
 
+// 🔥 ESCÁNER DE INSERCIÓN (Mata el error "Ver en YouTube")
+async function isVideoEmbeddable(videoId) {
+    try {
+        const url = `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`;
+        // Si responde 200 OK, el creador permite inserción
+        await axios.get(url, { timeout: 3000 });
+        return true;
+    } catch (error) {
+        // Si responde un error (401/403/404), el creador prohibió la inserción
+        return false;
+    }
+}
+
 function getBoxState(sede, boxId) {
     const roomKey = `${sede}-${boxId}`;
     if (!boxesState[roomKey]) {
@@ -93,25 +105,37 @@ io.on('connection', (socket) => {
             // Extraemos solo los que son videos
             let items = data.contents.filter(item => item.video);
 
-            // 🔥 FILTRO EXTERMINADOR LOCAL
-            // Eliminamos disqueras y videos oficiales que RapidAPI haya dejado pasar
+            // 1. FILTRO EXTERMINADOR DE TEXTO (Limpia disqueras evidentes)
             const blackList = ['vevo', 'official video', 'video oficial', 'official', 'umg', 'sme', 'wmg', 'sonymusic', 'warnermusic', 'latinautor', 'umpg', 'topic'];
 
-            const validItems = items.filter(item => {
+            let preFilteredItems = items.filter(item => {
                 const author = (item.video.author?.title || '').toLowerCase();
                 const title = (item.video.title || '').toLowerCase();
                 const esBloqueado = blackList.some(word => author.includes(word) || title.includes(word));
                 return !esBloqueado;
-            })
-                .slice(0, 5) // Tomamos los 5 mejores limpios
-                .map(item => ({
-                    id: Math.random().toString(36),
-                    title: item.video.title,
-                    videoId: item.video.videoId,
-                    thumbnail: item.video.thumbnails && item.video.thumbnails.length > 0 ? item.video.thumbnails[0].url : '',
-                    // RapidAPI youtube138 devuelve los segundos directos en lengthSeconds
-                    duration: parseInt(item.video.lengthSeconds) || 0
-                }));
+            });
+
+            // Tomamos los primeros 8 sobrevivientes para el escáner profundo
+            const candidates = preFilteredItems.slice(0, 8);
+
+            // 2. ESCÁNER DE INSERCIÓN EN PARALELO (Mata los bloqueos silenciosos)
+            const validaciones = candidates.map(async (item) => {
+                const esSeguro = await isVideoEmbeddable(item.video.videoId);
+                if (esSeguro) {
+                    return {
+                        id: Math.random().toString(36),
+                        title: item.video.title,
+                        videoId: item.video.videoId,
+                        thumbnail: item.video.thumbnails && item.video.thumbnails.length > 0 ? item.video.thumbnails[0].url : '',
+                        duration: parseInt(item.video.lengthSeconds) || 0
+                    };
+                }
+                return null; // El video exigía verse directo en YouTube
+            });
+
+            // Juntamos resultados y despachamos los 5 ganadores absolutos
+            const resolved = await Promise.all(validaciones);
+            const validItems = resolved.filter(i => i !== null).slice(0, 5);
 
             searchCache[cacheKey] = { results: validItems, timestamp: Date.now() };
             socket.emit('resultados_busqueda', validItems);
@@ -192,6 +216,6 @@ io.on('connection', (socket) => {
     });
 });
 
-setInterval(() => { console.log("Sopranos Heartbeat: Servidor activo..."); }, 300000);
+setInterval(() => { console.log("Heartbeat: Servidor activo..."); }, 300000);
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`Servidor activo en ${PORT}`));
