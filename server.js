@@ -3,8 +3,8 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
-const ytsr = require('ytsr'); // Volvemos a ytsr, gratis y sin límites de cuota
-const axios = require('axios');
+const ytsr = require('ytsr');
+const youtubedl = require('youtube-dl-exec'); // 🔥 Motor Multiproceso de Python
 
 const app = express();
 app.use(cors());
@@ -19,23 +19,21 @@ const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } 
 const boxesState = {};
 const searchCache = {};
 
-// ESCÁNER DE SEGURIDAD (Por si se cuela algo bloqueado)
-async function isVideoEmbeddable(videoId) {
-    try {
-        const url = `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`;
-        await axios.get(url, { timeout: 3000 });
-        return true;
-    } catch (error) {
-        return false;
-    }
-}
-
 function getBoxState(sede, boxId) {
     const roomKey = `${sede}-${boxId}`;
     if (!boxesState[roomKey]) {
         boxesState[roomKey] = { sede, boxId, estadoReproduccion: 'idle', cancionActual: null, playlist: [], currentIndex: 0, tiempoActual: 0 };
     }
     return boxesState[roomKey];
+}
+
+// Movido afuera para que esté disponible globalmente
+function parseDuration(durationStr) {
+    if (!durationStr) return 0;
+    const parts = durationStr.split(':').map(Number);
+    if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+    if (parts.length === 2) return parts[0] * 60 + parts[1];
+    return parts[0];
 }
 
 io.on('connection', (socket) => {
@@ -57,8 +55,8 @@ io.on('connection', (socket) => {
             // 🔥 EL PIVOTE A ROCOLA: Forzamos la búsqueda estricta de Karaokes
             const queryRocola = query.trim() + " karaoke";
 
-            // Buscamos 10 resultados usando ytsr
-            const searchResults = await ytsr(queryRocola, { limit: 10 });
+            // Buscamos 12 resultados rápidos usando ytsr
+            const searchResults = await ytsr(queryRocola, { limit: 12 });
 
             if (!searchResults || !searchResults.items) {
                 socket.emit('resultados_busqueda', []);
@@ -67,7 +65,7 @@ io.on('connection', (socket) => {
 
             let items = searchResults.items.filter(item => item.type === 'video');
 
-            // Filtramos todo lo que parezca oficial
+            // Filtro manual de limpieza
             const blackList = ['vevo', 'official video', 'video oficial', 'official', 'umg', 'sme', 'wmg', 'sonymusic', 'warnermusic', 'topic'];
 
             let preFilteredItems = items.filter(item => {
@@ -76,42 +74,49 @@ io.on('connection', (socket) => {
                 return !blackList.some(word => author.includes(word) || title.includes(word));
             });
 
-            const candidates = preFilteredItems.slice(0, 8);
+            // Seleccionamos exactamente 5 candidatos para lanzar los 5 subprocesos (no más para no saturar la RAM)
+            const candidates = preFilteredItems.slice(0, 5);
 
-            // Verificamos que se puedan reproducir en la TV
+            // 🔥 EL MULTIPROCESO (Python al rescate evaluando todos al mismo tiempo)
             const validaciones = candidates.map(async (item) => {
-                const esSeguro = await isVideoEmbeddable(item.id);
-                if (esSeguro) {
+                try {
+                    // El motor de Python lee la API interna directamente
+                    const videoData = await youtubedl(`https://www.youtube.com/watch?v=${item.id}`, {
+                        dumpSingleJson: true,
+                        skipDownload: true, // Solo metadata, no descargamos nada
+                        simulate: true,
+                        noWarnings: true,
+                        callHome: false
+                    });
+
                     return {
                         id: Math.random().toString(36),
-                        title: item.title,
-                        videoId: item.id,
+                        title: videoData.title || item.title,
+                        videoId: videoData.id || item.id,
                         thumbnail: item.bestThumbnail?.url || '',
-                        duration: parseDuration(item.duration)
+                        // Python devuelve la duración en segundos enteros
+                        duration: videoData.duration || parseDuration(item.duration)
                     };
+                } catch (errorPython) {
+                    // Si el video tiene copyright duro o bloqueos extraños, el binario revienta y lo atrapamos
+                    console.log(`[Python Escáner] ❌ Eliminando video restringido: ${item.title}`);
+                    return null;
                 }
-                return null;
             });
 
+            // Esperamos que los 5 clones de Python terminen su trabajo
             const resolved = await Promise.all(validaciones);
-            const validItems = resolved.filter(i => i !== null).slice(0, 5);
+            // Filtramos los que dieron error (null)
+            const validItems = resolved.filter(i => i !== null);
 
             searchCache[cacheKey] = { results: validItems, timestamp: Date.now() };
             socket.emit('resultados_busqueda', validItems);
 
         } catch (e) {
-            console.error("Error en búsqueda Rocola:", e.message);
+            console.error("Error crítico en búsqueda multiproceso:", e.message);
             socket.emit('resultados_busqueda', []);
         }
     });
-
-    function parseDuration(durationStr) {
-        if (!durationStr) return 0;
-        const parts = durationStr.split(':').map(Number);
-        if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
-        if (parts.length === 2) return parts[0] * 60 + parts[1];
-        return parts[0];
-    }
 
     socket.on('unirse_box', ({ sede, boxId }) => {
         const roomKey = `${sede}-${boxId}`;
