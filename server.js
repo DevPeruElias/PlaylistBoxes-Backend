@@ -27,7 +27,7 @@ function getBoxState(sede, boxId) {
     return boxesState[roomKey];
 }
 
-// Movido afuera para que esté disponible globalmente
+// Función global para parsear la duración
 function parseDuration(durationStr) {
     if (!durationStr) return 0;
     const parts = durationStr.split(':').map(Number);
@@ -52,62 +52,58 @@ io.on('connection', (socket) => {
         }
 
         try {
-            // 🔥 EL PIVOTE A ROCOLA: Forzamos la búsqueda estricta de Karaokes
-            const queryRocola = query.trim() + " karaoke";
-
-            // Buscamos 12 resultados rápidos usando ytsr
-            const searchResults = await ytsr(queryRocola, { limit: 12 });
+            // 1. BÚSQUEDA ABIERTA Y LIBRE: Exactamente lo que el cliente pida
+            const searchResults = await ytsr(query.trim(), { limit: 10 });
 
             if (!searchResults || !searchResults.items) {
                 socket.emit('resultados_busqueda', []);
                 return;
             }
 
-            let items = searchResults.items.filter(item => item.type === 'video');
+            const items = searchResults.items.filter(item => item.type === 'video');
 
-            // Filtro manual de limpieza
-            const blackList = ['vevo', 'official video', 'video oficial', 'official', 'umg', 'sme', 'wmg', 'sonymusic', 'warnermusic', 'topic'];
+            // Tomamos los 6 primeros resultados para evaluarlos a fondo
+            const candidates = items.slice(0, 6);
 
-            let preFilteredItems = items.filter(item => {
-                const author = (item.author?.name || '').toLowerCase();
-                const title = (item.title || '').toLowerCase();
-                return !blackList.some(word => author.includes(word) || title.includes(word));
-            });
-
-            // Seleccionamos exactamente 5 candidatos para lanzar los 5 subprocesos (no más para no saturar la RAM)
-            const candidates = preFilteredItems.slice(0, 5);
-
-            // 🔥 EL MULTIPROCESO (Python al rescate evaluando todos al mismo tiempo)
+            // 🔥 2. LA DOBLE BARRERA DE SEGURIDAD (En paralelo)
             const validaciones = candidates.map(async (item) => {
                 try {
-                    // El motor de Python lee la API interna directamente
+                    // BARRERA 1: Verificamos si el creador permite reproducirlo fuera de YouTube
+                    const oembedUrl = `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${item.id}&format=json`;
+                    const oembedRes = await fetch(oembedUrl); // Usamos fetch nativo de Node.js
+                    if (!oembedRes.ok) {
+                        console.log(`[Escáner] ❌ Omitiendo (El autor prohibió la inserción): ${item.title}`);
+                        return null; // Lo matamos aquí, daría el error "Ver en YouTube"
+                    }
+
+                    // BARRERA 2: Python lee la API interna para verificar bloqueos de disquera o país (LatinAutor/UMPG)
                     const videoData = await youtubedl(`https://www.youtube.com/watch?v=${item.id}`, {
                         dumpSingleJson: true,
-                        skipDownload: true, // Solo metadata, no descargamos nada
+                        skipDownload: true, // No descargamos el video, solo extraemos metadatos reales
                         simulate: true,
                         noWarnings: true,
                         callHome: false
                     });
 
+                    // Si sobrevive a ambas barreras, es 100% SEGURO para reproducir
                     return {
                         id: Math.random().toString(36),
                         title: videoData.title || item.title,
                         videoId: videoData.id || item.id,
                         thumbnail: item.bestThumbnail?.url || '',
-                        // Python devuelve la duración en segundos enteros
                         duration: videoData.duration || parseDuration(item.duration)
                     };
                 } catch (errorPython) {
-                    // Si el video tiene copyright duro o bloqueos extraños, el binario revienta y lo atrapamos
-                    console.log(`[Python Escáner] ❌ Eliminando video restringido: ${item.title}`);
+                    // Si el video tiene copyright duro o bloqueos extraños, Python lo detecta y lo descartamos
+                    console.log(`[Python Escáner] ❌ Eliminando video restringido por disquera/bloqueo: ${item.title}`);
                     return null;
                 }
             });
 
-            // Esperamos que los 5 clones de Python terminen su trabajo
+            // Esperamos que los clones de Python terminen su revisión
             const resolved = await Promise.all(validaciones);
-            // Filtramos los que dieron error (null)
-            const validItems = resolved.filter(i => i !== null);
+            // Filtramos los que fueron destruidos (null) y enviamos un máximo de 5 a la app
+            const validItems = resolved.filter(i => i !== null).slice(0, 5);
 
             searchCache[cacheKey] = { results: validItems, timestamp: Date.now() };
             socket.emit('resultados_busqueda', validItems);
@@ -188,6 +184,6 @@ io.on('connection', (socket) => {
     });
 });
 
-setInterval(() => { console.log("Heartbeat: Servidor activo..."); }, 300000);
+setInterval(() => { console.log("Sopranos Heartbeat: Servidor activo..."); }, 300000);
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`Servidor activo en ${PORT}`));
