@@ -4,13 +4,16 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const ytSearch = require('yt-search');
-const youtubedl = require('youtube-dl-exec'); // El motor nativo de Python que actúa como Snaptube
+const youtubedl = require('youtube-dl-exec');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 50 });
+// 🔥 SOLUCIÓN AL ERROR DE RENDER: Confiar en el proxy para el rate limiter
+app.set('trust proxy', 1);
+
+const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100 });
 app.use('/api/', limiter);
 
 const server = http.createServer(app);
@@ -27,7 +30,7 @@ function getBoxState(sede, boxId) {
     return boxesState[roomKey];
 }
 
-// 🔥 EL ENDPOINT MAESTRO: La TV pide aquí el enlace directo .mp4 extraído por Python
+// 🔥 ENDPOINT HTTP OPTIMIZADO: Python extrae el .mp4 puro para la TV
 app.get('/api/stream/:videoId', async (req, res) => {
     try {
         const videoId = req.params.videoId;
@@ -58,6 +61,7 @@ io.on('connection', (socket) => {
         io.to(roomKey).emit('estado_box_actualizado', boxesState[roomKey]);
     });
 
+    // 🔥 BÚSQUEDA INSTÁNTANEA: Sin bloqueos pesados, responde al vuelo
     socket.on('buscar_cancion', async ({ query }) => {
         if (!query) return;
         const cacheKey = query.toLowerCase().trim();
@@ -75,31 +79,14 @@ io.on('connection', (socket) => {
                 return;
             }
 
-            const candidates = r.videos.slice(0, 8);
-
-            const validations = candidates.map(async (v) => {
-                try {
-                    const oembedUrl = `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${v.videoId}&format=json`;
-                    const oembedRes = await fetch(oembedUrl, { timeout: 2000 });
-
-                    if (!oembedRes.ok) {
-                        return null;
-                    }
-
-                    return {
-                        id: Math.random().toString(36),
-                        title: v.title,
-                        videoId: v.videoId,
-                        thumbnail: v.thumbnail,
-                        duration: v.seconds
-                    };
-                } catch (e) {
-                    return null;
-                }
-            });
-
-            const resolved = await Promise.all(validations);
-            const validItems = resolved.filter(i => i !== null).slice(0, 5);
+            // Devolvemos los resultados inmediatamente sin validar OEmbed lento
+            const validItems = r.videos.slice(0, 5).map(v => ({
+                id: Math.random().toString(36),
+                title: v.title,
+                videoId: v.videoId,
+                thumbnail: v.thumbnail,
+                duration: v.seconds
+            }));
 
             searchCache[cacheKey] = { results: validItems, timestamp: Date.now() };
             socket.emit('resultados_busqueda', validItems);
