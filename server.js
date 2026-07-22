@@ -3,8 +3,6 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
-const ytsr = require('ytsr');
-const youtubedl = require('youtube-dl-exec');
 
 const app = express();
 app.use(cors());
@@ -19,6 +17,34 @@ const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } 
 const boxesState = {};
 const searchCache = {};
 
+// 🔥 RULETA DE ESPEJOS DE INVIDIOUS (Bypass de YouTube)
+const INVIDIOUS_INSTANCES = [
+    'https://vid.puffyan.us',
+    'https://invidious.nerdvpn.de',
+    'https://invidious.jing.rocks',
+    'https://inv.tux.pizza'
+];
+
+async function buscarEnInvidious(query) {
+    // Priorizamos resultados de Perú con region=PE para mayor precisión
+    const urlQuery = encodeURIComponent(query.trim());
+
+    for (const instancia of INVIDIOUS_INSTANCES) {
+        try {
+            const url = `${instancia}/api/v1/search?q=${urlQuery}&region=PE`;
+            const response = await fetch(url, { timeout: 3500 }); // Si demora más de 3.5s, saltamos al siguiente
+
+            if (response.ok) {
+                return await response.json(); // Retorna el array de resultados
+            }
+        } catch (err) {
+            console.log(`[Invidious] Instancia saturada (${instancia}), rotando...`);
+            continue;
+        }
+    }
+    throw new Error("Todas las instancias de búsqueda están ocupadas.");
+}
+
 function getBoxState(sede, boxId) {
     const roomKey = `${sede}-${boxId}`;
     if (!boxesState[roomKey]) {
@@ -27,65 +53,62 @@ function getBoxState(sede, boxId) {
     return boxesState[roomKey];
 }
 
-function parseDuration(durationStr) {
-    if (!durationStr) return 0;
-    const parts = durationStr.split(':').map(Number);
-    if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
-    if (parts.length === 2) return parts[0] * 60 + parts[1];
-    return parts[0];
-}
-
 io.on('connection', (socket) => {
+    socket.on('admin_reiniciar_box', ({ sede, boxId }) => {
+        const roomKey = `${sede}-${boxId}`;
+        boxesState[roomKey] = { sede, boxId, estadoReproduccion: 'idle', cancionActual: null, playlist: [], currentIndex: 0, tiempoActual: 0 };
+        io.to(roomKey).emit('box_reiniciado');
+        io.to(roomKey).emit('estado_box_actualizado', boxesState[roomKey]);
+    });
+
     socket.on('buscar_cancion', async ({ query }) => {
         if (!query) return;
         const cacheKey = query.toLowerCase().trim();
 
-        // Uso de caché para velocidad instantánea
         if (searchCache[cacheKey] && (Date.now() - searchCache[cacheKey].timestamp < 3600000)) {
             socket.emit('resultados_busqueda', searchCache[cacheKey].results);
             return;
         }
 
         try {
-            // 1. BUSCADOR (ytsr)
-            const searchResults = await ytsr(query.trim(), { limit: 8 });
-            if (!searchResults || !searchResults.items) {
+            // 1. BUSCADOR FANTASMA (Invidious API)
+            const searchResults = await buscarEnInvidious(query);
+
+            if (!searchResults || searchResults.length === 0) {
                 socket.emit('resultados_busqueda', []);
                 return;
             }
 
-            const items = searchResults.items.filter(item => item.type === 'video');
-            const candidates = items.slice(0, 5); // 5 es el "punto dulce" para no colapsar la RAM
+            // Invidious ya devuelve el tipo, filtramos videos y tomamos 6 prospectos
+            const items = searchResults.filter(item => item.type === 'video').slice(0, 6);
 
-            // 2. INSPECTOR DE CALIDAD (yt-dlp Multiproceso)
-            const validaciones = candidates.map(async (item) => {
+            // 2. FILTRO LIGERO (OEmbed): Mata el error "Ver en YouTube" con 0 costo de RAM
+            const validaciones = items.map(async (item) => {
                 try {
-                    // Usamos --dump-single-json para obtener todo en un objeto y validar
-                    const videoData = await youtubedl(`https://www.youtube.com/watch?v=${item.id}`, {
-                        dumpSingleJson: true,
-                        skipDownload: true,
-                        noWarnings: true,
-                        callHome: false
-                    });
+                    const oembedUrl = `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${item.videoId}&format=json`;
+                    const oembedRes = await fetch(oembedUrl, { timeout: 2000 });
 
-                    // Si llega aquí, el video es apto.
+                    if (!oembedRes.ok) {
+                        return null; // El autor desactivó la inserción en páginas externas
+                    }
+
+                    // Si sobrevive, formateamos los datos.
+                    // Invidious ya nos da los segundos exactos (lengthSeconds)
                     return {
                         id: Math.random().toString(36),
-                        title: videoData.title || item.title,
-                        videoId: videoData.id || item.id,
-                        thumbnail: item.bestThumbnail?.url || '',
-                        duration: videoData.duration || parseDuration(item.duration)
+                        title: item.title,
+                        videoId: item.videoId,
+                        // Forzamos la miniatura oficial de alta calidad de YouTube
+                        thumbnail: `https://i.ytimg.com/vi/${item.videoId}/hqdefault.jpg`,
+                        duration: item.lengthSeconds || 0
                     };
-                } catch (err) {
-                    // Si el video está bloqueado por copyright o geografía, yt-dlp arroja error.
-                    // Lo ignoramos para que no salga en la lista.
-                    console.log(`[Seguridad] Video bloqueado filtrado: ${item.title}`);
-                    return null;
+                } catch (e) {
+                    return null; // Si hay error de red, lo omitimos por seguridad
                 }
             });
 
             const resolved = await Promise.all(validaciones);
-            const validItems = resolved.filter(i => i !== null);
+            const validItems = resolved.filter(i => i !== null).slice(0, 5);
 
             searchCache[cacheKey] = { results: validItems, timestamp: Date.now() };
             socket.emit('resultados_busqueda', validItems);
@@ -96,11 +119,16 @@ io.on('connection', (socket) => {
         }
     });
 
-    // ... (El resto de tus eventos: unirse_box, agregar_cancion, etc., se quedan iguales)
     socket.on('unirse_box', ({ sede, boxId }) => {
         const roomKey = `${sede}-${boxId}`;
         socket.join(roomKey);
         socket.emit('estado_box_actualizado', getBoxState(sede, boxId));
+    });
+
+    socket.on('actualizar_progreso', ({ sede, boxId, tiempoActual }) => {
+        const state = getBoxState(sede, boxId);
+        state.tiempoActual = tiempoActual;
+        io.to(`${sede}-${boxId}`).emit('progreso_actualizado', tiempoActual);
     });
 
     socket.on('agregar_cancion', ({ sede, boxId, cancion, usuario }) => {
@@ -122,6 +150,14 @@ io.on('connection', (socket) => {
                 else { state.cancionActual = null; state.estadoReproduccion = 'idle'; state.currentIndex = 0; state.tiempoActual = 0; }
             }
         }
+        io.to(`${sede}-${boxId}`).emit('estado_box_actualizado', state);
+    });
+
+    socket.on('reordenar_playlist', ({ sede, boxId, startIndex, endIndex }) => {
+        const state = getBoxState(sede, boxId);
+        const [removed] = state.playlist.splice(startIndex, 1);
+        state.playlist.splice(endIndex, 0, removed);
+        if (state.cancionActual) { state.currentIndex = state.playlist.findIndex(c => c.id === state.cancionActual.id); }
         io.to(`${sede}-${boxId}`).emit('estado_box_actualizado', state);
     });
 
