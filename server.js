@@ -3,7 +3,8 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
-const ytSearch = require('yt-search'); // 🔥 Librería estable e inmune al crash de YouTube
+const ytSearch = require('yt-search');
+const youtubedl = require('youtube-dl-exec'); // El motor nativo de Python que actúa como Snaptube
 
 const app = express();
 app.use(cors());
@@ -26,6 +27,29 @@ function getBoxState(sede, boxId) {
     return boxesState[roomKey];
 }
 
+// 🔥 EL ENDPOINT MAESTRO: La TV pide aquí el enlace directo .mp4 extraído por Python
+app.get('/api/stream/:videoId', async (req, res) => {
+    try {
+        const videoId = req.params.videoId;
+        const output = await youtubedl(`https://www.youtube.com/watch?v=${videoId}`, {
+            format: 'best[ext=mp4]/best',
+            getUrl: true,
+            noWarnings: true,
+            callHome: false
+        });
+
+        const directUrl = typeof output === 'string' ? output.trim().split('\n')[0] : '';
+        if (!directUrl) {
+            return res.status(404).json({ error: 'No se pudo extraer el enlace' });
+        }
+
+        res.json({ url: directUrl });
+    } catch (error) {
+        console.error('Error extrayendo stream con Python:', error.message);
+        res.status(500).json({ error: 'Error interno al procesar el video' });
+    }
+});
+
 io.on('connection', (socket) => {
     socket.on('admin_reiniciar_box', ({ sede, boxId }) => {
         const roomKey = `${sede}-${boxId}`;
@@ -38,14 +62,12 @@ io.on('connection', (socket) => {
         if (!query) return;
         const cacheKey = query.toLowerCase().trim();
 
-        // 1. Caché para velocidad instantánea
         if (searchCache[cacheKey] && (Date.now() - searchCache[cacheKey].timestamp < 3600000)) {
             socket.emit('resultados_busqueda', searchCache[cacheKey].results);
             return;
         }
 
         try {
-            // 2. BÚSQUEDA SEGURA (yt-search)
             const r = await ytSearch(query.trim());
 
             if (!r || !r.videos || r.videos.length === 0) {
@@ -53,34 +75,30 @@ io.on('connection', (socket) => {
                 return;
             }
 
-            // Tomamos los 8 mejores resultados
             const candidates = r.videos.slice(0, 8);
 
-            // 3. FILTRO OEMBED: Solo destruye los videos que prohíben la reproducción externa
-            const validaciones = candidates.map(async (v) => {
+            const validations = candidates.map(async (v) => {
                 try {
                     const oembedUrl = `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${v.videoId}&format=json`;
                     const oembedRes = await fetch(oembedUrl, { timeout: 2000 });
 
                     if (!oembedRes.ok) {
-                        return null; // El autor lo bloqueó para páginas externas, lo descartamos
+                        return null;
                     }
 
-                    // Si responde OK, el video es apto para la lista
                     return {
                         id: Math.random().toString(36),
                         title: v.title,
                         videoId: v.videoId,
                         thumbnail: v.thumbnail,
-                        duration: v.seconds // yt-search ya nos da los segundos exactos
+                        duration: v.seconds
                     };
                 } catch (e) {
                     return null;
                 }
             });
 
-            const resolved = await Promise.all(validaciones);
-            // Filtramos los nulos y nos quedamos con los 5 mejores limpios
+            const resolved = await Promise.all(validations);
             const validItems = resolved.filter(i => i !== null).slice(0, 5);
 
             searchCache[cacheKey] = { results: validItems, timestamp: Date.now() };

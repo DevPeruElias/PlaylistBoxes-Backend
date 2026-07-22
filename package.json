@@ -18,6 +18,7 @@
     "express": "^5.2.1",
     "express-rate-limit": "^8.5.2",
     "socket.io": "^4.8.3",
+    "youtube-dl-exec": "^3.1.9",
     "yt-search": "^2.13.1"
   }
 }
