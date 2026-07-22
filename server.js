@@ -3,6 +3,7 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
+const ytSearch = require('yt-search'); // 🔥 Librería estable e inmune al crash de YouTube
 
 const app = express();
 app.use(cors());
@@ -16,34 +17,6 @@ const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } 
 
 const boxesState = {};
 const searchCache = {};
-
-// 🔥 RULETA DE ESPEJOS DE INVIDIOUS (Bypass de YouTube)
-const INVIDIOUS_INSTANCES = [
-    'https://vid.puffyan.us',
-    'https://invidious.nerdvpn.de',
-    'https://invidious.jing.rocks',
-    'https://inv.tux.pizza'
-];
-
-async function buscarEnInvidious(query) {
-    // Priorizamos resultados de Perú con region=PE para mayor precisión
-    const urlQuery = encodeURIComponent(query.trim());
-
-    for (const instancia of INVIDIOUS_INSTANCES) {
-        try {
-            const url = `${instancia}/api/v1/search?q=${urlQuery}&region=PE`;
-            const response = await fetch(url, { timeout: 3500 }); // Si demora más de 3.5s, saltamos al siguiente
-
-            if (response.ok) {
-                return await response.json(); // Retorna el array de resultados
-            }
-        } catch (err) {
-            console.log(`[Invidious] Instancia saturada (${instancia}), rotando...`);
-            continue;
-        }
-    }
-    throw new Error("Todas las instancias de búsqueda están ocupadas.");
-}
 
 function getBoxState(sede, boxId) {
     const roomKey = `${sede}-${boxId}`;
@@ -65,49 +38,49 @@ io.on('connection', (socket) => {
         if (!query) return;
         const cacheKey = query.toLowerCase().trim();
 
+        // 1. Caché para velocidad instantánea
         if (searchCache[cacheKey] && (Date.now() - searchCache[cacheKey].timestamp < 3600000)) {
             socket.emit('resultados_busqueda', searchCache[cacheKey].results);
             return;
         }
 
         try {
-            // 1. BUSCADOR FANTASMA (Invidious API)
-            const searchResults = await buscarEnInvidious(query);
+            // 2. BÚSQUEDA SEGURA (yt-search)
+            const r = await ytSearch(query.trim());
 
-            if (!searchResults || searchResults.length === 0) {
+            if (!r || !r.videos || r.videos.length === 0) {
                 socket.emit('resultados_busqueda', []);
                 return;
             }
 
-            // Invidious ya devuelve el tipo, filtramos videos y tomamos 6 prospectos
-            const items = searchResults.filter(item => item.type === 'video').slice(0, 6);
+            // Tomamos los 8 mejores resultados
+            const candidates = r.videos.slice(0, 8);
 
-            // 2. FILTRO LIGERO (OEmbed): Mata el error "Ver en YouTube" con 0 costo de RAM
-            const validaciones = items.map(async (item) => {
+            // 3. FILTRO OEMBED: Solo destruye los videos que prohíben la reproducción externa
+            const validaciones = candidates.map(async (v) => {
                 try {
-                    const oembedUrl = `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${item.videoId}&format=json`;
+                    const oembedUrl = `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${v.videoId}&format=json`;
                     const oembedRes = await fetch(oembedUrl, { timeout: 2000 });
 
                     if (!oembedRes.ok) {
-                        return null; // El autor desactivó la inserción en páginas externas
+                        return null; // El autor lo bloqueó para páginas externas, lo descartamos
                     }
 
-                    // Si sobrevive, formateamos los datos.
-                    // Invidious ya nos da los segundos exactos (lengthSeconds)
+                    // Si responde OK, el video es apto para la lista
                     return {
                         id: Math.random().toString(36),
-                        title: item.title,
-                        videoId: item.videoId,
-                        // Forzamos la miniatura oficial de alta calidad de YouTube
-                        thumbnail: `https://i.ytimg.com/vi/${item.videoId}/hqdefault.jpg`,
-                        duration: item.lengthSeconds || 0
+                        title: v.title,
+                        videoId: v.videoId,
+                        thumbnail: v.thumbnail,
+                        duration: v.seconds // yt-search ya nos da los segundos exactos
                     };
                 } catch (e) {
-                    return null; // Si hay error de red, lo omitimos por seguridad
+                    return null;
                 }
             });
 
             const resolved = await Promise.all(validaciones);
+            // Filtramos los nulos y nos quedamos con los 5 mejores limpios
             const validItems = resolved.filter(i => i !== null).slice(0, 5);
 
             searchCache[cacheKey] = { results: validItems, timestamp: Date.now() };
