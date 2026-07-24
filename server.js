@@ -4,7 +4,7 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const ytSearch = require('yt-search');
-const youtubedl = require('youtube-dl-exec');
+const ytdl = require('@distube/ytdl-core'); // 🚀 El nuevo motor nativo de Node.js (Cero Python)
 
 const app = express();
 app.use(cors());
@@ -30,25 +30,27 @@ function getBoxState(sede, boxId) {
     return boxesState[roomKey];
 }
 
-// 🔥 ENDPOINT HTTP OPTIMIZADO: Python extrae el .mp4 puro para la TV
+// 🚀 ENDPOINT HTTP OPTIMIZADO: Node.js puro extrae el .mp4 para la TV
 app.get('/api/stream/:videoId', async (req, res) => {
     try {
         const videoId = req.params.videoId;
-        const output = await youtubedl(`https://www.youtube.com/watch?v=${videoId}`, {
-            format: 'best[ext=mp4]/best',
-            getUrl: true,
-            noWarnings: true,
-            callHome: false
-        });
+        const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
 
-        const directUrl = typeof output === 'string' ? output.trim().split('\n')[0] : '';
-        if (!directUrl) {
-            return res.status(404).json({ error: 'No se pudo extraer el enlace' });
+        // Obtenemos toda la data del video directamente de los servidores de Google
+        const info = await ytdl.getInfo(videoUrl);
+
+        // Filtramos para obtener el mejor enlace directo que contenga Video + Audio en formato MP4
+        const format = info.formats
+            .filter(f => f.hasVideo && f.hasAudio && f.container === 'mp4')
+            .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
+
+        if (format && format.url) {
+            res.json({ url: format.url });
+        } else {
+            res.status(404).json({ error: 'No se encontró un formato mp4 compatible.' });
         }
-
-        res.json({ url: directUrl });
     } catch (error) {
-        console.error('Error extrayendo stream con Python:', error.message);
+        console.error('Error extrayendo stream con ytdl-core:', error.message);
         res.status(500).json({ error: 'Error interno al procesar el video' });
     }
 });
