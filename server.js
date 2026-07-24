@@ -28,39 +28,67 @@ function getBoxState(sede, boxId) {
     return boxesState[roomKey];
 }
 
-// 🚀 EL EXTRACTOR PROXY (Cobalt API - El estándar actual anti-bloqueos)
+// 🚀 EL EXTRACTOR PROXY CON DIAGNÓSTICO PROFUNDO
 app.get('/api/stream/:videoId', async (req, res) => {
     const videoId = req.params.videoId;
+    const targetUrl = 'https://co.wuk.sh/api/json';
 
     try {
-        // Hacemos una petición directa a la granja de proxies de Cobalt
-        const response = await fetch('https://co.wuk.sh/api/json', {
+        console.log(`\n[Proxy] Intentando extraer video: ${videoId}...`);
+
+        const response = await fetch(targetUrl, {
             method: 'POST',
             headers: {
                 'Accept': 'application/json',
                 'Content-Type': 'application/json',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+                // 🔥 CAMUFLAJE: Hacemos creer al servidor que somos un humano navegando en la web oficial
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+                'Origin': 'https://cobalt.tools',
+                'Referer': 'https://cobalt.tools/'
             },
             body: JSON.stringify({
                 url: `https://www.youtube.com/watch?v=${videoId}`,
-                vQuality: '720', // Calidad óptima para TV sin sobrecargar la red WiFi
+                vQuality: '720',
                 isAudioOnly: false,
                 isNoTTWatermark: true
             }),
-            timeout: 8000
+            timeout: 10000 // Le damos 10 segundos antes de rendirnos
         });
 
-        if (response.ok) {
-            const data = await response.json();
-            if (data && data.url) {
-                return res.json({ url: data.url }); // ¡Bingo! Enlace directo MP4 a la TV
-            }
+        if (!response.ok) {
+            // Si el servidor responde pero nos da un error (ej. 403 Forbidden)
+            const errorText = await response.text();
+            console.error(`\n🔴 [ERROR DE API COBALT] Status: ${response.status}`);
+            console.error(`🔴 Motivo del rechazo: ${errorText}\n`);
+            return res.status(response.status).json({ error: 'La API rechazó la extracción', detalle: errorText });
         }
 
-        return res.status(404).json({ error: 'Proxy no pudo extraer el video' });
+        const data = await response.json();
+
+        if (data && data.url) {
+            console.log(`[Proxy] ✅ Éxito! URL limpia obtenida para ${videoId}`);
+            return res.json({ url: data.url });
+        } else {
+            console.error(`\n🔴 [ERROR DE DATOS] La API respondió, pero no envió ninguna URL. Respuesta:`, data);
+            return res.status(404).json({ error: 'No se obtuvo URL válida' });
+        }
+
     } catch (error) {
-        console.error('Error en Proxy de extracción:', error.message);
-        res.status(500).json({ error: 'Error interno del proxy' });
+        // 🔥 EL COMENTARIO Y DIAGNÓSTICO EXACTO QUE PEDISTE
+        console.error('\n======================================================');
+        console.error('🔴 ERROR CRÍTICO DE RED EN LA EXTRACCIÓN (FETCH FAILED)');
+        console.error('======================================================');
+        console.error('1. Mensaje general :', error.message);
+        console.error('2. Causa interna   :', error.cause ? error.cause : 'Ninguna (Bloqueo directo o Timeout)');
+        console.error('3. Código de error :', error.code || 'Desconocido');
+        console.error('4. Pila de error   :\n', error.stack);
+        console.error('======================================================\n');
+
+        res.status(500).json({
+            error: 'Fallo la conexión de red desde Render',
+            mensaje: error.message,
+            causa: error.cause ? error.cause.toString() : 'Desconocida'
+        });
     }
 });
 
