@@ -4,13 +4,12 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const ytSearch = require('yt-search');
-const ytdl = require('@distube/ytdl-core'); // 🚀 El nuevo motor nativo de Node.js (Cero Python)
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// 🔥 SOLUCIÓN AL ERROR DE RENDER: Confiar en el proxy para el rate limiter
+// 🔥 Confiar en el proxy de Render
 app.set('trust proxy', 1);
 
 const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100 });
@@ -30,29 +29,40 @@ function getBoxState(sede, boxId) {
     return boxesState[roomKey];
 }
 
-// 🚀 ENDPOINT HTTP OPTIMIZADO: Node.js puro extrae el .mp4 para la TV
+// 🚀 EL EXTRACTOR MAESTRO: Usa una red de Proxies para evadir el bloqueo de IP de Render
 app.get('/api/stream/:videoId', async (req, res) => {
-    try {
-        const videoId = req.params.videoId;
-        const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
+    const videoId = req.params.videoId;
 
-        // Obtenemos toda la data del video directamente de los servidores de Google
-        const info = await ytdl.getInfo(videoUrl);
+    // Instancias públicas robustas que devuelven el video sin que YouTube se entere de tu IP
+    const PIPED_INSTANCES = [
+        'https://pipedapi.kavin.rocks',
+        'https://pipedapi.smnz.de',
+        'https://piped-api.garudalinux.org',
+        'https://api.piped.projectsegfau.lt'
+    ];
 
-        // Filtramos para obtener el mejor enlace directo que contenga Video + Audio en formato MP4
-        const format = info.formats
-            .filter(f => f.hasVideo && f.hasAudio && f.container === 'mp4')
-            .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
+    for (const api of PIPED_INSTANCES) {
+        try {
+            // Hacemos la petición a la API proxy
+            const response = await fetch(`${api}/streams/${videoId}`, { timeout: 4500 });
 
-        if (format && format.url) {
-            res.json({ url: format.url });
-        } else {
-            res.status(404).json({ error: 'No se encontró un formato mp4 compatible.' });
+            if (response.ok) {
+                const data = await response.json();
+                // Buscamos un stream MP4 con audio y video integrado
+                const stream = data.videoStreams.find(s => !s.videoOnly && s.mimeType.includes('mp4'));
+
+                if (stream && stream.url) {
+                    return res.json({ url: stream.url }); // Se lo enviamos a la TV
+                }
+            }
+        } catch (error) {
+            console.log(`[Extractor] Instancia ocupada, rotando: ${api}`);
+            continue; // Si falla una instancia, pasa a la siguiente instantáneamente
         }
-    } catch (error) {
-        console.error('Error extrayendo stream con ytdl-core:', error.message);
-        res.status(500).json({ error: 'Error interno al procesar el video' });
     }
+
+    // Si todas fallan
+    return res.status(404).json({ error: 'No se pudo extraer el enlace libre de bloqueos' });
 });
 
 io.on('connection', (socket) => {
@@ -63,7 +73,6 @@ io.on('connection', (socket) => {
         io.to(roomKey).emit('estado_box_actualizado', boxesState[roomKey]);
     });
 
-    // 🔥 BÚSQUEDA INSTÁNTANEA: Sin bloqueos pesados, responde al vuelo
     socket.on('buscar_cancion', async ({ query }) => {
         if (!query) return;
         const cacheKey = query.toLowerCase().trim();
@@ -81,7 +90,6 @@ io.on('connection', (socket) => {
                 return;
             }
 
-            // Devolvemos los resultados inmediatamente sin validar OEmbed lento
             const validItems = r.videos.slice(0, 5).map(v => ({
                 id: Math.random().toString(36),
                 title: v.title,
