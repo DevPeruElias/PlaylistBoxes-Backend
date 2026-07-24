@@ -9,7 +9,6 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// 🔥 Confiar en el proxy de Render
 app.set('trust proxy', 1);
 
 const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100 });
@@ -29,40 +28,40 @@ function getBoxState(sede, boxId) {
     return boxesState[roomKey];
 }
 
-// 🚀 EL EXTRACTOR MAESTRO: Usa una red de Proxies para evadir el bloqueo de IP de Render
+// 🚀 EL EXTRACTOR PROXY (Cobalt API - El estándar actual anti-bloqueos)
 app.get('/api/stream/:videoId', async (req, res) => {
     const videoId = req.params.videoId;
 
-    // Instancias públicas robustas que devuelven el video sin que YouTube se entere de tu IP
-    const PIPED_INSTANCES = [
-        'https://pipedapi.kavin.rocks',
-        'https://pipedapi.smnz.de',
-        'https://piped-api.garudalinux.org',
-        'https://api.piped.projectsegfau.lt'
-    ];
+    try {
+        // Hacemos una petición directa a la granja de proxies de Cobalt
+        const response = await fetch('https://co.wuk.sh/api/json', {
+            method: 'POST',
+            headers: {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+            },
+            body: JSON.stringify({
+                url: `https://www.youtube.com/watch?v=${videoId}`,
+                vQuality: '720', // Calidad óptima para TV sin sobrecargar la red WiFi
+                isAudioOnly: false,
+                isNoTTWatermark: true
+            }),
+            timeout: 8000
+        });
 
-    for (const api of PIPED_INSTANCES) {
-        try {
-            // Hacemos la petición a la API proxy
-            const response = await fetch(`${api}/streams/${videoId}`, { timeout: 4500 });
-
-            if (response.ok) {
-                const data = await response.json();
-                // Buscamos un stream MP4 con audio y video integrado
-                const stream = data.videoStreams.find(s => !s.videoOnly && s.mimeType.includes('mp4'));
-
-                if (stream && stream.url) {
-                    return res.json({ url: stream.url }); // Se lo enviamos a la TV
-                }
+        if (response.ok) {
+            const data = await response.json();
+            if (data && data.url) {
+                return res.json({ url: data.url }); // ¡Bingo! Enlace directo MP4 a la TV
             }
-        } catch (error) {
-            console.log(`[Extractor] Instancia ocupada, rotando: ${api}`);
-            continue; // Si falla una instancia, pasa a la siguiente instantáneamente
         }
-    }
 
-    // Si todas fallan
-    return res.status(404).json({ error: 'No se pudo extraer el enlace libre de bloqueos' });
+        return res.status(404).json({ error: 'Proxy no pudo extraer el video' });
+    } catch (error) {
+        console.error('Error en Proxy de extracción:', error.message);
+        res.status(500).json({ error: 'Error interno del proxy' });
+    }
 });
 
 io.on('connection', (socket) => {
